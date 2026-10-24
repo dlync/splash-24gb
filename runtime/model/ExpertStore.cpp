@@ -110,6 +110,18 @@ uint32_t predictTopK() noexcept {
   return k;
 }
 
+// FORK (read-ahead tuning): SPLASH_AHEAD_LIMIT=n issues at most n read-ahead groups a
+// step, the highest summed routing weight first (predictedExperts' order);
+// 0/unset = as many as there are places. Caps the SSD traffic an unbiased
+// prediction's long tail of unlikely experts would cost.
+uint32_t aheadLimit() noexcept {
+  static const uint32_t limit = [] {
+    const char *value = std::getenv("SPLASH_AHEAD_LIMIT");
+    return value ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 0u;
+  }();
+  return limit;
+}
+
 unsigned aheadReaders() noexcept {
   static const unsigned readers = [] {
     if (const char *value = std::getenv("SPLASH_AHEAD_READERS")) {
@@ -734,7 +746,9 @@ void ExpertStore::Impl::startAhead() {
   try {
     retireAhead();
     uint32_t place = 0;
+    const uint32_t limit = aheadLimit();
     for (const uint32_t expert : plan.experts) {
+      if (limit && ahead.reads.groups.size() >= limit) break;
       while (place < places.count && taken[place]) ++place;
       if (place == places.count) break;
       // Expert after expert, so that the experts a round finds read whole
