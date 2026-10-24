@@ -5,6 +5,7 @@
 #include "metal/abi/MoE.h"
 #include "ops/BufferExtent.hpp"
 
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <tuple>
@@ -77,6 +78,15 @@ std::string routingKernel(std::string name, MoeShape shape) {
 // each decode their own pass's formats. The register tile runs two passes.
 bool oneGateUpPass(const MoePlan &plan) noexcept { return plan.configuration().ggufTile == MoeGgufTile::Staged; }
 
+// FORK (split-pass experiment): SPLASH_SPLIT_TAIL=n, see addExperts.
+uint32_t splitTailTiles() noexcept {
+  static const uint32_t tail = [] {
+    const char *value = std::getenv("SPLASH_SPLIT_TAIL");
+    return value ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 0u;
+  }();
+  return tail;
+}
+
 // The expert passes over grouped tiles, each on the grid of the live
 // tiles that the grouping wrote (MoeTileCount), within the column tiles of
 // `group` and maximumTiles(): gate and up in one pass into
@@ -101,13 +111,24 @@ void addExperts(metal::CommandGraph &graph, const MoeScratch &scratch, const Blo
   const std::string kernel = table16 ? "moe_expert_gguf_sg" : "moe_expert_gguf_m" + std::to_string(plan.tileRows());
   const metal::IndirectGrid gateUpGrid{scratch.tileCount, offsetof(MoeTileCount, gate_up_grid)};
   const metal::IndirectGrid downGrid{scratch.tileCount, offsetof(MoeTileCount, down_grid)};
-  const auto params = [&](const BlockExpertProjection &projection, uint32_t n, uint32_t k) {
-    return MoeGgufExpertParams{k, n, shape.experts, projection.routed.formatId, projection.shared.formatId};
+  // FORK (split-pass experiment): SPLASH_SPLIT_TAIL=n runs a decode step's staged
+  // expert passes twice, pass A over live tiles [n, ...) on the indirect grid
+  // and pass B over tiles [0, n) on a static grid of n, the same tiles on the
+  // same kernels (bit-identical); measures the cost of the split desk-first
+  // needs. 0/unset = one pass.
+  const uint32_t splitTail = plan.phase() == MoePhase::Decode && !table16 ? splitTailTiles() : 0;
+  // Pass ranges: {begin, limit, static tiles (0 = indirect grid)}.
+  struct Range { uint32_t begin, limit, fixed; };
+  std::vector<Range> ranges{{0, 0, 0}};
+  if (splitTail) ranges = {{splitTail, 0, 0}, {0, splitTail, splitTail}};
+  const auto params = [&](const BlockExpertProjection &projection, uint32_t n, uint32_t k, const Range &range) {
+    return MoeGgufExpertParams{k, n, shape.experts, projection.routed.formatId, projection.shared.formatId,
+                               range.begin, range.limit};
   };
   const auto pass = [&](const BlockExpertProjection &projection, bool up,
                         const metal::MetalBuffer &passInput,
                         const metal::MetalBuffer &output, uint32_t n, uint32_t k,
-                        uint32_t columns, const metal::IndirectGrid &grid) {
+                        uint32_t columns, const metal::IndirectGrid &grid, const Range &range) {
     std::vector<metal::MetalBuffer> bindings{passInput};
     if (table16) bindings.push_back(scratch.groupedSums);
     bindings.insert(bindings.end(),
@@ -116,39 +137,50 @@ void addExperts(metal::CommandGraph &graph, const MoeScratch &scratch, const Blo
                      projection.routed.meta, projection.shared.plane0,
                      projection.shared.plane1Slot(), projection.shared.meta, output,
                      scratch.expertOutput, weights.slotTable});
-    graph.add(kernel + (up ? "_g" : "_a"), std::move(bindings), params(projection, n, k), {columns, tiles, 1}, grid,
-              {threads, 1, 1});
+    if (range.fixed)
+      graph.add(kernel + (up ? "_g" : "_a"), std::move(bindings), params(projection, n, k, range),
+                {columns, range.fixed, 1}, {threads, 1, 1});
+    else
+      graph.add(kernel + (up ? "_g" : "_a"), std::move(bindings), params(projection, n, k, range),
+                {columns, tiles, 1}, grid, {threads, 1, 1});
   };
   const uint32_t hidden = shape.hiddenSize;
   const uint32_t intermediate = shape.expertIntermediateSize;
-  if (oneGateUpPass(plan)) {
-    const BlockExpertProjection &gate = weights.gate, &up = weights.up;
-    // One pair table where gate and up share their formats, one each otherwise.
-    const bool mixed = gate.routed.formatId != up.routed.formatId || gate.shared.formatId != up.shared.formatId;
-    graph.add(kernel + (mixed ? "_gate_up_mixed" : "_gate_up"),
-              {scratch.groupedInput, scratch.tileDescriptors, scratch.tileCount,
-               gate.routed.plane0, gate.routed.plane1Slot(), gate.routed.meta,
-               gate.shared.plane0, gate.shared.plane1Slot(), gate.shared.meta,
-               up.routed.plane0, up.routed.plane1Slot(), up.routed.meta,
-               up.shared.plane0, up.shared.plane1Slot(), up.shared.meta,
-               scratch.expertIntermediate, weights.slotTable},
-              MoeGgufGateUpParams{hidden, intermediate, shape.experts, gate.routed.formatId, gate.shared.formatId,
-                                  up.routed.formatId, up.shared.formatId},
-              {group.gate_up_columns, tiles, 1}, gateUpGrid, {threads, 1, 1});
-  } else {
-    pass(weights.gate, false, scratch.groupedInput, scratch.expertOutput,
-         intermediate, hidden, group.gate_up_columns, gateUpGrid);
-    pass(weights.up, true, scratch.groupedInput, scratch.expertIntermediate,
-         intermediate, hidden, group.gate_up_columns, gateUpGrid);
+  for (const Range &range : ranges) {
+    if (oneGateUpPass(plan)) {
+      const BlockExpertProjection &gate = weights.gate, &up = weights.up;
+      // One pair table where gate and up share their formats, one each otherwise.
+      const bool mixed = gate.routed.formatId != up.routed.formatId || gate.shared.formatId != up.shared.formatId;
+      const MoeGgufGateUpParams gateUp{hidden, intermediate, shape.experts, gate.routed.formatId,
+                                       gate.shared.formatId, up.routed.formatId, up.shared.formatId,
+                                       range.begin, range.limit};
+      std::vector<metal::MetalBuffer> bindings{scratch.groupedInput, scratch.tileDescriptors, scratch.tileCount,
+                                               gate.routed.plane0, gate.routed.plane1Slot(), gate.routed.meta,
+                                               gate.shared.plane0, gate.shared.plane1Slot(), gate.shared.meta,
+                                               up.routed.plane0, up.routed.plane1Slot(), up.routed.meta,
+                                               up.shared.plane0, up.shared.plane1Slot(), up.shared.meta,
+                                               scratch.expertIntermediate, weights.slotTable};
+      if (range.fixed)
+        graph.add(kernel + (mixed ? "_gate_up_mixed" : "_gate_up"), std::move(bindings), gateUp,
+                  {group.gate_up_columns, range.fixed, 1}, {threads, 1, 1});
+      else
+        graph.add(kernel + (mixed ? "_gate_up_mixed" : "_gate_up"), std::move(bindings), gateUp,
+                  {group.gate_up_columns, tiles, 1}, gateUpGrid, {threads, 1, 1});
+    } else {
+      pass(weights.gate, false, scratch.groupedInput, scratch.expertOutput,
+           intermediate, hidden, group.gate_up_columns, gateUpGrid, range);
+      pass(weights.up, true, scratch.groupedInput, scratch.expertIntermediate,
+           intermediate, hidden, group.gate_up_columns, gateUpGrid, range);
+    }
+    if (table16)
+      graph.add("moe_prepare_table16",
+                {scratch.expertIntermediate, scratch.tileCount,
+                 scratch.groupedInput, scratch.groupedSums},
+                intermediate, {tiles, (intermediate + 255) / 256, 1});
+    pass(weights.down, false,
+         table16 ? scratch.groupedInput : scratch.expertIntermediate,
+         scratch.expertOutput, hidden, intermediate, group.down_columns, downGrid, range);
   }
-  if (table16)
-    graph.add("moe_prepare_table16",
-              {scratch.expertIntermediate, scratch.tileCount,
-               scratch.groupedInput, scratch.groupedSums},
-              intermediate, {tiles, (intermediate + 255) / 256, 1});
-  pass(weights.down, false,
-       table16 ? scratch.groupedInput : scratch.expertIntermediate,
-       scratch.expertOutput, hidden, intermediate, group.down_columns, downGrid);
 }
 
 } // namespace

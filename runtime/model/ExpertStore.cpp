@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -678,12 +679,23 @@ void ExpertStore::Impl::stage(uint32_t index, uint32_t capacity, ExpertStoreStat
     at += count;
   }
   std::atomic<uint64_t> bytes = 0;
+  // FORK (wait trace): time the synchronous reads of this round.
+  const auto syncStart = std::chrono::steady_clock::now();
   readers->run(now.pieces.size(), [&](size_t task) {
     const Piece &piece = now.pieces[task];
     readPiece(now.groups[piece.group], piece);
     bytes += piece.to - piece.from;
   });
   use.readBytes += bytes;
+  // FORK (wait trace): "W block staged syncGroups pieces bytes us" per round.
+  if (FILE *trace = routeTrace()) {
+    const auto syncUs =
+        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - syncStart).count();
+    std::fprintf(trace, "W %u %u %u %u %llu %lld\n", index, static_cast<unsigned>(staged.size()),
+                 static_cast<unsigned>(now.groups.size() - std::min<size_t>(now.groups.size(), wholeAhead)),
+                 static_cast<unsigned>(now.pieces.size()), static_cast<unsigned long long>(bytes.load()),
+                 static_cast<long long>(syncUs));
+  }
   // What the load read is the sources' as they were opened.
   if (!staged.empty())
     for (const std::function<void()> &check : checks) check();

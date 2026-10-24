@@ -116,10 +116,14 @@ struct MoeGgufExpertParams {
   uint32_t experts;
   uint32_t routed_format;
   uint32_t shared_format;
+  // FORK (desk-first): the pass runs live tiles [tile_begin, tile_limit);
+  // tile_limit 0 = no limit. Both 0 (the default) = every live tile.
+  uint32_t tile_begin;
+  uint32_t tile_limit;
 };
 
-static_assert(sizeof(MoeGgufExpertParams) == 20,
-              "MoE GGUF expert parameters are 20 bytes on both sides");
+static_assert(sizeof(MoeGgufExpertParams) == 28,
+              "MoE GGUF expert parameters are 28 bytes on both sides");
 
 // The gate and up passes in one (moe_expert_gguf_m<rows>_gate_up[_mixed]): their
 // sizes and expert count, as MoeGgufExpertParams holds them, and each pass's
@@ -132,10 +136,13 @@ struct MoeGgufGateUpParams {
   uint32_t gate_shared_format;
   uint32_t up_routed_format;
   uint32_t up_shared_format;
+  // FORK (desk-first): live tiles [tile_begin, tile_limit), as MoeGgufExpertParams.
+  uint32_t tile_begin;
+  uint32_t tile_limit;
 };
 
-static_assert(sizeof(MoeGgufGateUpParams) == 28,
-              "MoE GGUF gate/up parameters are 28 bytes on both sides");
+static_assert(sizeof(MoeGgufGateUpParams) == 36,
+              "MoE GGUF gate/up parameters are 36 bytes on both sides");
 
 // One projection (gate, up or down) of the experts a load writes into their
 // slots (moe_expert_load, model/ExpertStore.cpp): rows x columns in `format`,
