@@ -239,7 +239,11 @@ enum class HostStepGpu : uint8_t {
 // command may have completed by then, so `then` must not throw: one that does
 // marks the backend unhealthy.
 struct EventStep {
-  enum class Kind : uint8_t { Signal, Wait, Host };
+  // FORK (desk-first): Resume ends the GPU work a deferred host step overlaps
+  // (CommandGraph::hostDeferred, resume): the work after it waits for the
+  // step; the dispatches between the step and its Resume run while the CPU
+  // works.
+  enum class Kind : uint8_t { Signal, Wait, Host, Resume };
 
   size_t before = 0;
   SharedEvent event;
@@ -249,6 +253,8 @@ struct EventStep {
   std::function<void(const HostStepTiming &)> timed{};
   HostStepGpu gpu = HostStepGpu::Idle;
   std::function<void()> then{};
+  // FORK (desk-first): a Host step whose wait a later Resume step encodes.
+  bool deferred = false;
 };
 
 // What one submission encodes: its dispatches in order, and the event steps

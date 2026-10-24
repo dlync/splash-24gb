@@ -1197,8 +1197,8 @@ void ExpertStore::bind(uint32_t block, ops::BlockMoeWeights &weights) {
   weights.streamBlock = block;
 }
 
-void ExpertStore::addLoad(metal::CommandGraph &graph, std::span<const ops::MoeLoadPart> parts,
-                          uint32_t block) const {
+void ExpertStore::addLoad(metal::CommandGraph &graph, std::span<const ops::MoeLoadPart> parts, uint32_t block,
+                          const std::function<void()> &overlap) const {
   const Impl &impl = *impl_;
   const Impl::Size &size = impl.sizes[impl.blocks.at(block).size];
   const ops::MoeShape shape = impl.shape;
@@ -1249,13 +1249,22 @@ void ExpertStore::addLoad(metal::CommandGraph &graph, std::span<const ops::MoeLo
   const metal::MetalBuffer logRoutes = logging ? parts.front().buffers->scratch.selectedExperts : metal::MetalBuffer{};
   const metal::MetalBuffer logVerify = logging ? parts.front().buffers->verifyRows : metal::MetalBuffer{};
   for (uint32_t round = 0; round < rounds; ++round) {
-    graph.host(
-        [impl = impl_, block, phase, rows, predicted, tiles, round, rounds, verifyRows, logging, logInput, logRoutes,
-         logVerify] {
-          impl->load(block, phase, rows, predicted, tiles, round, rounds, verifyRows);
-          if (logging && round == 0) impl->logHidden(block, rows, predicted, logInput, logRoutes, logVerify);
-        },
-        timed, gpu, startAhead);
+    const auto work = [impl = impl_, block, phase, rows, predicted, tiles, round, rounds, verifyRows, logging,
+                       logInput, logRoutes, logVerify] {
+      impl->load(block, phase, rows, predicted, tiles, round, rounds, verifyRows);
+      if (logging && round == 0) impl->logHidden(block, rows, predicted, logInput, logRoutes, logVerify);
+    };
+    // FORK (desk-first): the first round's step overlaps `overlap`'s GPU work
+    // (the resident experts' passes), which reads no slot the step claims:
+    // route() touches every routed expert's slot before it claims, and the
+    // recycler never recycles a slot touched this load.
+    if (overlap && round == 0 && phase == ops::MoePhase::Decode) {
+      graph.hostDeferred(work, timed, gpu, startAhead);
+      overlap();
+      graph.resume();
+    } else {
+      graph.host(work, timed, gpu, startAhead);
+    }
     ops::MoE::addExpertLoad(graph, impl.staging, size.arena, impl.jobs, impl.sources, size.load,
                             static_cast<uint32_t>(std::min<uint64_t>(routable, impl.places.count)),
                             metal::IndirectGrid{impl.grid, 0});

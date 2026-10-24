@@ -172,7 +172,9 @@ NSUInteger addedBuffers(const EventStep &step) noexcept {
     switch (step.kind) {
     case EventStep::Kind::Signal: return 1;
     case EventStep::Kind::Wait: return 0;
+    // FORK (desk-first): a deferred step's buffers are its own and its resume's.
     case EventStep::Kind::Host: return step.gpu == HostStepGpu::Awake ? 2 : 1;
+    case EventStep::Kind::Resume: return 1;
     }
     return 0;
 }
@@ -183,11 +185,20 @@ NSUInteger addedBuffers(const EventStep &step) noexcept {
 NSUInteger checkEvents(std::span<const EventStep> events, size_t dispatches) {
     size_t before = 0;
     NSUInteger buffers = 1;
+    // FORK (desk-first): a deferred host step awaiting its resume.
+    bool deferred = false;
     for (const EventStep &step : events) {
-        if (step.kind == EventStep::Kind::Host ? !step.work : !step.event || !step.value)
+        if (step.kind == EventStep::Kind::Resume) {
+            if (!deferred) throw MetalBackendError("a resume step follows no deferred host step");
+            deferred = false;
+        } else if (deferred) {
+            throw MetalBackendError("a deferred host step's resume comes before any other event step");
+        } else if (step.kind == EventStep::Kind::Host ? !step.work : !step.event || !step.value) {
             throw MetalBackendError(step.kind == EventStep::Kind::Host
                                         ? "host step needs work"
                                         : "event step needs an event and a nonzero value");
+        }
+        if (step.kind == EventStep::Kind::Host && step.deferred) deferred = true;
         if (step.gpu == HostStepGpu::Awake && step.kind != EventStep::Kind::Host)
             throw MetalBackendError("only a host step keeps the GPU awake");
         if (step.before < before)
@@ -198,6 +209,7 @@ NSUInteger checkEvents(std::span<const EventStep> events, size_t dispatches) {
         before = step.before;
         buffers += addedBuffers(step);
     }
+    if (deferred) throw MetalBackendError("a deferred host step has no resume step");
     if (buffers > kMaximumCommandBuffers)
         throw MetalBackendError("Metal command's event steps take more command "
                                 "buffers than its queue holds");
@@ -1190,6 +1202,72 @@ struct MetalBackend::Impl {
         return next;
     }
 
+    // FORK (desk-first): a deferred host step (CommandGraph::hostDeferred). As
+    // encodeHostStep, but only the buffer before the step is committed here:
+    // the dispatches up to the step's resume go into a middle buffer this
+    // returns, which runs while the CPU works; the spin (encoded now, so the
+    // runner knows its release) and the buffer that waits for the step are
+    // committed by encodeHostStepResume, in that order after the middle
+    // buffer. The work after the resume starts in a buffer of its own, so
+    // what the CPU wrote is visible to it; the middle buffer must read none
+    // of it. The work after the resume reads what the middle buffer wrote:
+    // the queue runs its buffers in commit order and tracks the hazards of
+    // the backend's buffers (every one comes from newBufferWithLength:
+    // options:, tracked by default), so it follows the middle buffer's
+    // completion. A deferred step's round trip (HostSteps::report) counts
+    // from the end of the buffer before the step to the start of the one
+    // after the resume, so its resume figure holds the middle buffer's run.
+    struct DeferredHostStep {
+        __strong id<MTLCommandBuffer> spin = nil;
+        __strong id<MTLCommandBuffer> next = nil;
+    };
+    template <class Fail>
+    id<MTLCommandBuffer> encodeHostStepDeferred(id<MTLCommandBuffer> command, std::vector<id<MTLCommandBuffer>> &leading,
+                                                std::shared_ptr<HostSteps> &steps, uint64_t sequence,
+                                                const EventStep &step, DeferredHostStep &deferred,
+                                                Fail &&failEncoding) {
+        if (!steps) {
+            steps = std::make_shared<HostSteps>();
+            steps->backend = asyncState;
+            steps->sequence = sequence;
+            steps->readyEvent = [device newSharedEvent];
+            steps->ranEvent = [device newSharedEvent];
+            if (!steps->readyEvent || !steps->ranEvent) failEncoding("unable to create Metal shared event");
+        }
+        const uint64_t ready = steps->steps.size() + 1;
+        [command encodeSignalEvent:steps->readyEvent value:ready];
+        leading.push_back(command);
+        std::optional<uint32_t> released;
+        deferred.spin = nil;
+        if (step.gpu == HostStepGpu::Awake && hostStepSpin) {
+            deferred.spin = [queue commandBuffer];
+            if (!deferred.spin) failEncoding("unable to create Metal command buffer");
+            released = encodeSpin(*hostStepSpin, deferred.spin, failEncoding);
+            steps->releases = hostStepSpin->releases;
+        }
+        deferred.next = [queue commandBuffer];
+        if (!deferred.next) failEncoding("unable to create Metal command buffer");
+        [deferred.next encodeWaitForEvent:steps->ranEvent value:ready];
+        steps->steps.push_back({ready, step.work, step.timed, step.then, command, deferred.next, 0.0, 0.0, released});
+        [command commit];
+        hostStepRunner->add(steps, steps->steps.back());
+        id<MTLCommandBuffer> middle = [queue commandBuffer];
+        if (!middle) failEncoding("unable to create Metal command buffer");
+        return middle;
+    }
+    id<MTLCommandBuffer> encodeHostStepResume(id<MTLCommandBuffer> middle, std::vector<id<MTLCommandBuffer>> &leading,
+                                              DeferredHostStep &deferred) {
+        leading.push_back(middle);
+        [middle commit];
+        if (deferred.spin) {
+            leading.push_back(deferred.spin);
+            [deferred.spin commit];
+        }
+        id<MTLCommandBuffer> next = deferred.next;
+        deferred = {};
+        return next;
+    }
+
     // Encodes into `buffer` one host_step_wait thread, which spins until the
     // release counter reaches the spin's next release value, and returns that
     // value.
@@ -1346,11 +1424,22 @@ struct MetalBackend::Impl {
                 // Encodes the event steps that follow the first `encoded`
                 // dispatches.
                 auto step = events.begin();
+                DeferredHostStep deferred;
                 const auto encodeSteps = [&](size_t encoded) {
                     for (; step != events.end() && step->before == encoded; ++step) {
                         if (encoder) {
                             [encoder endEncoding];
                             encoder = nil;
+                        }
+                        // FORK (desk-first): deferred host steps and their resumes.
+                        if (step->kind == EventStep::Kind::Resume) {
+                            command = encodeHostStepResume(command, leading, deferred);
+                            continue;
+                        }
+                        if (step->kind == EventStep::Kind::Host && step->deferred) {
+                            command = encodeHostStepDeferred(command, leading, ticketState->hostSteps,
+                                                             ticketState->sequence, *step, deferred, failEncoding);
+                            continue;
                         }
                         if (step->kind == EventStep::Kind::Host) {
                             command = encodeHostStep(command, leading, ticketState->hostSteps,
@@ -1482,13 +1571,16 @@ struct MetalBackend::Impl {
     CommandTicket submitProfiled(std::span<const ComputeDispatch> dispatches,
                                  std::span<const EventStep> events,
                                  CommandCompletion completion) {
-        if (std::ranges::any_of(events, [](const EventStep &step) { return step.kind != EventStep::Kind::Host; }))
+        if (std::ranges::any_of(events, [](const EventStep &step) {
+                return step.kind != EventStep::Kind::Host && step.kind != EventStep::Kind::Resume;
+            }))
             throw MetalBackendError("dispatch profiling does not replay event steps");
         const PreparedCommand command = prepare(dispatches);
         CommandTiming total;
         auto step = events.begin();
         const auto runSteps = [&](size_t before) {
             for (; step != events.end() && step->before == before; ++step) {
+                if (step->kind == EventStep::Kind::Resume) continue;
                 step->work();
                 if (step->then) step->then();
             }

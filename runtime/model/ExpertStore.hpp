@@ -121,7 +121,11 @@ public:
   // the store, which loads them; the store keeps the block's router and
   // shared-expert gate, set before, which predict its routes.
   void bind(uint32_t block, ops::BlockMoeWeights &weights);
-  void addLoad(metal::CommandGraph &graph, std::span<const ops::MoeLoadPart> parts, uint32_t block) const override;
+  // FORK (desk-first): with `overlap`, a decode load's first round is a
+  // deferred host step: `overlap` adds the GPU work that runs while it works.
+  using ops::MoeExpertStream::addLoad;
+  void addLoad(metal::CommandGraph &graph, std::span<const ops::MoeLoadPart> parts, uint32_t block,
+               const std::function<void()> &overlap) const override;
   [[nodiscard]] ExpertStoreStats stats() const;
   // The arena and the staging, while no command is in flight; restore()
   // takes both back in one part and reads the experts of the sizes of one

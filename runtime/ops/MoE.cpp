@@ -5,6 +5,7 @@
 #include "metal/abi/MoE.h"
 #include "ops/BufferExtent.hpp"
 
+#include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
@@ -93,7 +94,9 @@ uint32_t splitTailTiles() noexcept {
 bool deskFirstEnabled() noexcept {
   static const bool enabled = [] {
     const char *value = std::getenv("SPLASH_DESK_FIRST");
-    return value && *value && *value != '0';
+    const bool on = value && *value && *value != '0';
+    if (on) std::fprintf(stderr, "FORK: SPLASH_DESK_FIRST on (resident-first grouping, two expert passes)\n");
+    return on;
   }();
   return enabled;
 }
@@ -101,6 +104,21 @@ bool deskFirst(const MoeBuffers &buffers, const BlockMoeWeights &weights, const 
   return deskFirstEnabled() && weights.stream && buffers.verifyRows && plan.phase() == MoePhase::Decode &&
          plan.configuration().ggufTile == MoeGgufTile::Staged;
 }
+// FORK (desk-first overlap): SPLASH_DESK_OVERLAP=1 (with
+// SPLASH_DESK_FIRST) runs the resident pass while the load's host step works
+// (MoeExpertStream::addLoad's overlap); without it the step comes first.
+bool deskOverlapEnabled() noexcept {
+  static const bool enabled = [] {
+    const char *value = std::getenv("SPLASH_DESK_OVERLAP");
+    const bool on = value && *value && *value != '0';
+    if (on) std::fprintf(stderr, "FORK: SPLASH_DESK_OVERLAP on (resident pass overlaps the load's host step)\n");
+    return on;
+  }();
+  return enabled;
+}
+
+// FORK (desk-first): which of a desk-first step's two passes to add.
+enum class ExpertPasses { All, Resident, Missing };
 
 // The expert passes over grouped tiles, each on the grid of the live
 // tiles that the grouping wrote (MoeTileCount), within the column tiles of
@@ -112,7 +130,7 @@ bool deskFirst(const MoeBuffers &buffers, const BlockMoeWeights &weights, const 
 // on register plans, whose down pass reads the tiles a prepare dispatch
 // writes there.
 void addExperts(metal::CommandGraph &graph, const MoeBuffers &buffers, const BlockMoeWeights &weights,
-                const MoePlan &plan, const MoeGroupParams &group) {
+                const MoePlan &plan, const MoeGroupParams &group, ExpertPasses which = ExpertPasses::All) {
   const MoeScratch &scratch = buffers.scratch;
   const MoeShape shape = plan.shape();
   const uint32_t tiles = plan.maximumTiles();
@@ -145,10 +163,14 @@ void addExperts(metal::CommandGraph &graph, const MoeBuffers &buffers, const Blo
   // FORK (desk-first): the resident tiles [0, resident_tiles) on the
   // resident grids, then the rest on the live grids (the kernels skip tiles
   // before resident_tiles: MOE_TILE_BEGIN_RESIDENT).
-  if (deskFirst(buffers, weights, plan))
-    ranges = {{0, 0, 0, {scratch.tileCount, offsetof(MoeTileCount, resident_gate_up_grid)},
-               {scratch.tileCount, offsetof(MoeTileCount, resident_down_grid)}},
-              {MOE_TILE_BEGIN_RESIDENT, 0, 0, gateUpGrid, downGrid}};
+  if (deskFirst(buffers, weights, plan)) {
+    const Range resident{0, 0, 0, {scratch.tileCount, offsetof(MoeTileCount, resident_gate_up_grid)},
+                         {scratch.tileCount, offsetof(MoeTileCount, resident_down_grid)}};
+    const Range missing{MOE_TILE_BEGIN_RESIDENT, 0, 0, gateUpGrid, downGrid};
+    ranges = which == ExpertPasses::Resident ? std::vector<Range>{resident}
+             : which == ExpertPasses::Missing ? std::vector<Range>{missing}
+                                              : std::vector<Range>{resident, missing};
+  }
   const auto params = [&](const BlockExpertProjection &projection, uint32_t n, uint32_t k, const Range &range) {
     return MoeGgufExpertParams{k, n, shape.experts, projection.routed.formatId, projection.shared.formatId,
                                range.begin, range.limit};
@@ -241,11 +263,63 @@ MoeGroupParams groupParams(const MoePlan &plan) {
           shape.hiddenSize / GGUF_TILE_COLUMNS, SPLASH_TARGET_VERIFY_ROWS};
 }
 
+// The gather of the routed rows into the tiles' inputs.
+void addGather(metal::CommandGraph &graph, const MoeBuffers &buffers, const MoePlan &plan) {
+  const MoeShape shape = plan.shape();
+  const uint32_t tiles = plan.maximumTiles();
+  const MoeScratch &scratch = buffers.scratch;
+  const MoeGatherParams gather{plan.tileRows(), shape.hiddenSize, shape.routesPerToken()};
+  if (plan.configuration().ggufTile == MoeGgufTile::Register)
+    graph.add("moe_gather_table16",
+              {buffers.input, scratch.groupedRoutes, scratch.tileCount,
+               scratch.groupedInput, scratch.groupedSums},
+              gather, {tiles, shape.hiddenSize / 256, 1});
+  else
+    graph.add("moe_gather_rows",
+              {buffers.input, scratch.groupedRoutes, scratch.tileDescriptors,
+               scratch.tileCount, scratch.groupedInput},
+              gather, {tiles, shape.hiddenSize / 256, 1});
+}
+
+void addCombine(metal::CommandGraph &graph, const MoeBuffers &buffers, const MoePlan &plan) {
+  const MoeShape shape = plan.shape();
+  const MoeScratch &scratch = buffers.scratch;
+  graph.add("moe_combine",
+            {scratch.expertOutput, scratch.routeRows, scratch.routingWeights,
+             buffers.residual, buffers.output},
+            MoeCombineParams{plan.rows(), shape.hiddenSize, shape.routesPerToken()},
+            {plan.rows(), shape.hiddenSize / 256, 1});
+}
+
 } // namespace
 
 void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
               const BlockMoeWeights &weights, const MoePlan &plan) {
   addRouting(graph, buffers, weights, plan);
+  // FORK (desk-first): the gather and the resident experts' pass run
+  // while the load's host step works (they read no slot it claims: route()
+  // touches every resident routed expert's slot first, and the recycler
+  // never recycles a slot touched this load); the missing experts' pass and
+  // the combine follow the load.
+  if (weights.stream && deskFirst(buffers, weights, plan)) {
+    const MoeLoadPart part{&buffers, &plan};
+    bool overlapped = false;
+    const auto overlap = [&] {
+      addGather(graph, buffers, plan);
+      addExperts(graph, buffers, weights, plan, groupParams(plan), ExpertPasses::Resident);
+      overlapped = true;
+    };
+    // Without SPLASH_DESK_OVERLAP: the step, then both passes; a
+    // stream that overlaps nothing (a prefill load, no round) gets the same.
+    // Resident + Missing add the same dispatches as All, in order: nothing
+    // in addExperts lies outside its range loop for the staged tile.
+    weights.stream->addLoad(graph, {&part, 1}, weights.streamBlock,
+                            deskOverlapEnabled() ? std::function<void()>(overlap) : std::function<void()>{});
+    if (!overlapped) overlap();
+    addExperts(graph, buffers, weights, plan, groupParams(plan), ExpertPasses::Missing);
+    addCombine(graph, buffers, plan);
+    return;
+  }
   if (weights.stream) {
     const MoeLoadPart part{&buffers, &plan};
     weights.stream->addLoad(graph, {&part, 1}, weights.streamBlock);
@@ -300,28 +374,9 @@ void MoE::addRouting(metal::CommandGraph &graph, const MoeBuffers &buffers,
 
 void MoE::addRouted(metal::CommandGraph &graph, const MoeBuffers &buffers,
                     const BlockMoeWeights &weights, const MoePlan &plan) {
-  const MoeShape shape = plan.shape();
-  const uint32_t rows = plan.rows();
-  const uint32_t tileRows = plan.tileRows();
-  const uint32_t tiles = plan.maximumTiles();
-  const MoeScratch &scratch = buffers.scratch;
-  const MoeGatherParams gather{tileRows, shape.hiddenSize, shape.routesPerToken()};
-  if (plan.configuration().ggufTile == MoeGgufTile::Register)
-    graph.add("moe_gather_table16",
-              {buffers.input, scratch.groupedRoutes, scratch.tileCount,
-               scratch.groupedInput, scratch.groupedSums},
-              gather, {tiles, shape.hiddenSize / 256, 1});
-  else
-    graph.add("moe_gather_rows",
-              {buffers.input, scratch.groupedRoutes, scratch.tileDescriptors,
-               scratch.tileCount, scratch.groupedInput},
-              gather, {tiles, shape.hiddenSize / 256, 1});
+  addGather(graph, buffers, plan);
   addExperts(graph, buffers, weights, plan, groupParams(plan));
-  graph.add("moe_combine",
-            {scratch.expertOutput, scratch.routeRows, scratch.routingWeights,
-             buffers.residual, buffers.output},
-            MoeCombineParams{rows, shape.hiddenSize, shape.routesPerToken()},
-            {rows, shape.hiddenSize / 256, 1});
+  addCombine(graph, buffers, plan);
 }
 
 void MoE::addRoutes(metal::CommandGraph &graph, const metal::MetalBuffer &input, const QuantizedSegment &router,

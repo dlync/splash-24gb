@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <span>
 
 namespace splash::ops {
@@ -106,7 +107,15 @@ struct MoeLoadPart final {
 class MoeExpertStream {
 public:
   virtual ~MoeExpertStream() = default;
-  virtual void addLoad(metal::CommandGraph &graph, std::span<const MoeLoadPart> parts, uint32_t block) const = 0;
+  // FORK (desk-first): `overlap`, when set, adds the GPU work that may run while
+  // the load's host step works (it reads nothing the step writes: the
+  // resident experts' passes); the load's repack and what follows wait for
+  // the step. A stream that cannot overlap adds it after the step.
+  virtual void addLoad(metal::CommandGraph &graph, std::span<const MoeLoadPart> parts, uint32_t block,
+                       const std::function<void()> &overlap) const = 0;
+  void addLoad(metal::CommandGraph &graph, std::span<const MoeLoadPart> parts, uint32_t block) const {
+    addLoad(graph, parts, block, {});
+  }
 };
 
 // Grouped-row scratch. Routes are sorted by expert into tiles of tileRows

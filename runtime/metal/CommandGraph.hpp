@@ -79,6 +79,17 @@ public:
     events_.push_back({dispatches_.size(), {}, 0, EventStep::Kind::Host, std::move(work), std::move(timed), gpu,
                        std::move(then)});
   }
+  // FORK (desk-first): a host step whose `work` starts once the work before it
+  // completed, as host()'s, but which holds back only the work after the
+  // next resume(): the dispatches between the two run while the CPU works
+  // (they must not read what `work` writes). `then` runs once the work
+  // after the resume may go. Every hostDeferred needs its resume().
+  void hostDeferred(std::function<void()> work, std::function<void(const HostStepTiming &)> timed = {},
+                    HostStepGpu gpu = HostStepGpu::Idle, std::function<void()> then = {}) {
+    events_.push_back({dispatches_.size(), {}, 0, EventStep::Kind::Host, std::move(work), std::move(timed), gpu,
+                       std::move(then), true});
+  }
+  void resume() { events_.push_back({dispatches_.size(), {}, 0, EventStep::Kind::Resume}); }
 
   [[nodiscard]] bool empty() const noexcept { return dispatches_.empty(); }
   // The dispatches alone; command() has the event steps too.
