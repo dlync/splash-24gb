@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
@@ -49,6 +50,44 @@ uint64_t syncPieceBytes() noexcept {
   }();
   return bytes;
 }
+// FORK (route trace): SPLASH_ROUTE_TRACE=<path> appends one line per load,
+// "block phase rows" then each routed expert as +id (resident) or -id (miss),
+// for an offline eviction replay. Off without the variable.
+FILE *routeTrace() noexcept {
+  static FILE *file = []() -> FILE * {
+    const char *path = std::getenv("SPLASH_ROUTE_TRACE");
+    return path && *path ? std::fopen(path, "a") : nullptr;
+  }();
+  return file;
+}
+
+// FORK (trace and log data): SPLASH_HIDDEN_LOG=<path> appends, per decode load, the
+// verified rows' MoE input (bf16, hidden wide), their routed experts and the
+// engine's own prediction of the next block's routes (zeros for the last
+// block), as training data for a lookahead guesser. SPLASH_HIDDEN_LOG_MAX_MB
+// (default 8192) stops the log. Off without the variable.
+struct HiddenLog final {
+  FILE *file = nullptr;
+  uint64_t written = 0, limit = 0;
+};
+HiddenLog &hiddenLog() noexcept {
+  static HiddenLog log = [] {
+    HiddenLog result;
+    const char *path = std::getenv("SPLASH_HIDDEN_LOG");
+    if (!path || !*path) return result;
+    result.file = std::fopen(path, "ab");
+    const char *cap = std::getenv("SPLASH_HIDDEN_LOG_MAX_MB");
+    const uint64_t mb = cap ? std::strtoull(cap, nullptr, 10) : 0;
+    result.limit = (mb ? mb : 8192) << 20;
+    return result;
+  }();
+  return log;
+}
+struct HiddenLogHeader final {
+  uint32_t magic, serial;
+  uint16_t block, rows, topk, hidden;
+};
+
 unsigned aheadReaders() noexcept {
   static const unsigned readers = [] {
     if (const char *value = std::getenv("SPLASH_AHEAD_READERS")) {
@@ -315,6 +354,8 @@ struct ExpertStore::Impl {
   // The host step after a long chunk's load: block `block`'s experts that
   // are not resident read ahead into the whole staging.
   void readBlockAhead(uint32_t block, ops::MoePhase phase);
+  void logHidden(uint32_t block, uint32_t rows, bool predicted, const metal::MetalBuffer &input,
+                 const metal::MetalBuffer &routes, const metal::MetalBuffer &verifyRows);
   void countAhead(size_t group, size_t from, size_t to);
   void retireAhead();
   void evict(Size &size, uint32_t slot);
@@ -437,6 +478,8 @@ void ExpertStore::Impl::route(uint32_t index, std::span<const std::span<const Mo
   const bool chunk = longChunk(phase, rows);
   ++serial;
   pendingBlock = index;
+  FILE *const trace = routeTrace();
+  if (trace) std::fprintf(trace, "%u %c %u", index, phase == ops::MoePhase::Decode ? 'D' : 'P', rows);
   for (std::span<const MoeTileDescriptor> tiles : parts)
     for (const MoeTileDescriptor &tile : tiles) {
       // Past the routed experts' tiles come the shared expert's (id experts).
@@ -446,10 +489,13 @@ void ExpertStore::Impl::route(uint32_t index, std::span<const std::span<const Mo
       ++use.routed;
       if (const uint32_t slot = block.slot[expert]; slot != kNoSlot) {
         size.recycling.touch(slot, serial, chunk);
+        if (trace) std::fprintf(trace, " +%u", expert);
         continue;
       }
+      if (trace) std::fprintf(trace, " -%u", expert);
       pending.push_back({expert, kNoSlot});
     }
+  if (trace) std::fputc('\n', trace);
   // Consecutive experts read together (stage).
   std::ranges::sort(pending);
   uint32_t *table = static_cast<uint32_t *>(tables.contents()) + uint64_t{index} * shape.experts;
@@ -850,6 +896,33 @@ void ExpertStore::Impl::load(uint32_t index, ops::MoePhase phase, uint32_t rows,
   publish();
 }
 
+// FORK (trace and log data): one record per decode load, see HiddenLog.
+void ExpertStore::Impl::logHidden(uint32_t index, uint32_t rows, bool predicted, const metal::MetalBuffer &input,
+                                  const metal::MetalBuffer &routes, const metal::MetalBuffer &verifyRows) {
+  HiddenLog &log = hiddenLog();
+  if (!log.file || log.written >= log.limit) return;
+  const uint32_t topk = shape.expertsPerToken, routesPerRow = shape.routesPerToken(), hidden = shape.hiddenSize;
+  const auto *verified = verifyRows ? static_cast<const uint32_t *>(verifyRows.contents()) : nullptr;
+  std::vector<uint32_t> live;
+  for (uint32_t row = 0; row < rows; ++row)
+    if (!verified || row % SPLASH_TARGET_VERIFY_ROWS < verified[row / SPLASH_TARGET_VERIFY_ROWS]) live.push_back(row);
+  if (live.empty()) return;
+  const HiddenLogHeader header{0x48494431u, static_cast<uint32_t>(serial), static_cast<uint16_t>(index),
+                               static_cast<uint16_t>(live.size()), static_cast<uint16_t>(topk),
+                               static_cast<uint16_t>(hidden)};
+  std::fwrite(&header, sizeof header, 1, log.file);
+  const auto *x = static_cast<const uint16_t *>(input.contents());
+  for (const uint32_t row : live) std::fwrite(x + uint64_t{row} * hidden, sizeof(uint16_t), hidden, log.file);
+  const auto *selected = static_cast<const uint32_t *>(routes.contents());
+  for (const uint32_t row : live) std::fwrite(selected + uint64_t{row} * routesPerRow, sizeof(uint32_t), topk, log.file);
+  const auto *guess = predicted ? static_cast<const uint32_t *>(predictionRoutes.contents()) : nullptr;
+  const std::vector<uint32_t> zeros(topk, 0);
+  for (const uint32_t row : live)
+    std::fwrite(guess ? guess + uint64_t{row} * routesPerRow : zeros.data(), sizeof(uint32_t), topk, log.file);
+  log.written += sizeof header + uint64_t{live.size()} * (uint64_t{hidden} * 2 + uint64_t{topk} * 8);
+  if (log.written >= log.limit) std::fflush(log.file);
+}
+
 void ExpertStore::Impl::readBlockAhead(uint32_t index, ops::MoePhase phase) {
   std::lock_guard lock(mutex);
   if (!failure.empty()) throw std::runtime_error("expert store failed earlier: " + failure);
@@ -1094,10 +1167,17 @@ void ExpertStore::addLoad(metal::CommandGraph &graph, std::span<const ops::MoeLo
   // Each step's read-ahead starts once the GPU went on (startAhead).
   const auto startAhead = [impl = impl_] { impl->startAhead(); };
   const metal::MetalBuffer verifyRows = predicted ? parts.front().buffers->verifyRows : metal::MetalBuffer{};
+  // FORK (trace and log data): what the hidden log reads after round 0 routed.
+  const bool logging = phase == ops::MoePhase::Decode && parts.size() == 1 && hiddenLog().file;
+  const metal::MetalBuffer logInput = logging ? parts.front().buffers->input : metal::MetalBuffer{};
+  const metal::MetalBuffer logRoutes = logging ? parts.front().buffers->scratch.selectedExperts : metal::MetalBuffer{};
+  const metal::MetalBuffer logVerify = logging ? parts.front().buffers->verifyRows : metal::MetalBuffer{};
   for (uint32_t round = 0; round < rounds; ++round) {
     graph.host(
-        [impl = impl_, block, phase, rows, predicted, tiles, round, rounds, verifyRows] {
+        [impl = impl_, block, phase, rows, predicted, tiles, round, rounds, verifyRows, logging, logInput, logRoutes,
+         logVerify] {
           impl->load(block, phase, rows, predicted, tiles, round, rounds, verifyRows);
+          if (logging && round == 0) impl->logHidden(block, rows, predicted, logInput, logRoutes, logVerify);
         },
         timed, gpu, startAhead);
     ops::MoE::addExpertLoad(graph, impl.staging, size.arena, impl.jobs, impl.sources, size.load,
