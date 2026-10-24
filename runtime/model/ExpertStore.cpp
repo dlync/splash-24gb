@@ -88,6 +88,28 @@ struct HiddenLogHeader final {
   uint16_t block, rows, topk, hidden;
 };
 
+// FORK (read-ahead tuning): SPLASH_PREDICT_BIAS=0 predicts the next block's routes
+// without the cache-aware routing bias. The bias demotes experts not resident,
+// which are exactly the ones a read-ahead is for: on logged decode data the
+// biased prediction's top-10 held 50% of the next block's misses, the
+// unbiased 78%. Unset or 1 = biased like the routing (the default).
+// SPLASH_PREDICT_TOPK=k plans only each row's k highest-ranked predicted
+// routes (0/unset = all top_k), for precision when reads are the limit.
+bool predictBiased() noexcept {
+  static const bool biased = [] {
+    const char *value = std::getenv("SPLASH_PREDICT_BIAS");
+    return !(value && *value == '0');
+  }();
+  return biased;
+}
+uint32_t predictTopK() noexcept {
+  static const uint32_t k = [] {
+    const char *value = std::getenv("SPLASH_PREDICT_TOPK");
+    return value ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 0u;
+  }();
+  return k;
+}
+
 unsigned aheadReaders() noexcept {
   static const unsigned readers = [] {
     if (const char *value = std::getenv("SPLASH_AHEAD_READERS")) {
@@ -670,9 +692,10 @@ std::span<const uint32_t> ExpertStore::Impl::predictedExperts(uint32_t rows, con
   const auto *verified = static_cast<const uint32_t *>(verifyRows.contents());
   const uint32_t routes = shape.routesPerToken();
   predictionOrder.clear();
+  const uint32_t planned = predictTopK() ? std::min(predictTopK(), shape.expertsPerToken) : shape.expertsPerToken;
   for (uint64_t row = 0; row < rows; ++row) {
     if (verified && row % SPLASH_TARGET_VERIFY_ROWS >= verified[row / SPLASH_TARGET_VERIFY_ROWS]) continue;
-    for (uint32_t route = 0; route < shape.expertsPerToken; ++route) {
+    for (uint32_t route = 0; route < planned; ++route) {
       const uint64_t at = row * routes + route;
       const uint32_t expert = selected[at];
       if (expert >= shape.experts) continue;
@@ -1176,7 +1199,8 @@ void ExpertStore::addLoad(metal::CommandGraph &graph, std::span<const ops::MoeLo
     ops::MoE::addRoutes(graph, parts.front().buffers->input, next.router, next.scalarGate, impl.predictionScores,
                         impl.predictionRoutes, impl.predictionWeights, rows, shape,
                         parts.front().plan->configuration().ggufRouterTile,
-                        impl.bias ? impl.biasViews[block + 1] : metal::MetalBuffer{}, impl.biasProtect);
+                        impl.bias && predictBiased() ? impl.biasViews[block + 1] : metal::MetalBuffer{},
+                        impl.biasProtect);
   }
   // A decode step's loads keep the GPU awake: they come about every
   // millisecond and most end within one, about as long as an idle GPU takes
