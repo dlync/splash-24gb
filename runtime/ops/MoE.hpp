@@ -80,6 +80,14 @@ struct BlockMoeWeights final {
   uint32_t slots = 0;
   const MoeExpertStream *stream = nullptr;
   uint32_t streamBlock = 0;
+  // FORK (cache-aware routing): the block's selection-only route bias (one float per
+  // expert) and the ranks chosen by raw score before it applies; empty and
+  // UINT32_MAX without one (an expert store sets them, ExpertStore::bind).
+  // Decode routing reads it; prefill routes as upstream unless
+  // routeBiasPrefill is set (SPLASH_ROUTE_BIAS_PREFILL).
+  metal::MetalBuffer routeBias;
+  uint32_t routeProtect = UINT32_MAX;
+  bool routeBiasPrefill = false;
 };
 
 // One MoE step of a block a load serves: its plan, and its buffers once the
@@ -289,10 +297,13 @@ struct MoE final {
   // shape.routerWidth()), then each row's top-k experts and the shared
   // expert with their routing weights in `selected` and `routingWeights`
   // (shape.routesPerToken() per row).
+  // FORK (cache-aware routing): with `routeBias` (a float per expert) and protect <
+  // expertsPerToken, the ranks from protect on are chosen by score + bias.
   static void addRoutes(metal::CommandGraph &graph, const metal::MetalBuffer &input, const QuantizedSegment &router,
                         const QuantizedSegment &sharedScalarGate, const metal::MetalBuffer &scores,
                         const metal::MetalBuffer &selected, const metal::MetalBuffer &routingWeights, uint32_t rows,
-                        MoeShape shape, FloatTile routerTile);
+                        MoeShape shape, FloatTile routerTile, const metal::MetalBuffer &routeBias = {},
+                        uint32_t protect = UINT32_MAX);
   // A streamed experts' load (MoeExpertStream::addLoad): the gate, up and
   // down projections of up to `jobs` experts, job j's projection z's native
   // rows in `staging` from sources[3j + z] (bytes) on, repacked into the

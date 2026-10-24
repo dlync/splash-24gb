@@ -20,6 +20,7 @@ template <uint Slots>
 inline void moe_route_select(device const float *scores, device bfloat *input,
                              device const float *shared_gate, device uint *selected,
                              device float *routing_weights,
+                             device const float *route_bias,
                              constant MoeRouteParams &params, uint group,
                              uint thread_index, uint simd_lane,
                              uint simd_group, threadgroup float *row_scores,
@@ -59,15 +60,28 @@ inline void moe_route_select(device const float *scores, device bfloat *input,
     return;
   // Lane l holds experts l, l + 32, ... Each rank takes the highest remaining
   // score and the lowest expert id among ties.
+  // FORK (cache-aware routing): ranks from params.protect on take the highest remaining
+  // score + route_bias[expert] (a selection-only bias: -delta on experts not
+  // resident in the block); their routing weights still come from the raw
+  // scores (ordered holds the winner's raw score).
+  const bool any_biased = params.protect < params.top_k;
   float lane_scores[ExpertsPerLane];
-  for (uint slot = 0; slot < ExpertsPerLane; ++slot)
-    lane_scores[slot] = row_scores[simd_lane + 32 * slot];
+  float lane_bias[ExpertsPerLane];
+  for (uint slot = 0; slot < ExpertsPerLane; ++slot) {
+    const uint expert = simd_lane + 32 * slot;
+    lane_scores[slot] = row_scores[expert];
+    lane_bias[slot] =
+        any_biased && expert < params.experts ? route_bias[expert] : 0.0f;
+  }
   for (uint rank = 0; rank < params.top_k; ++rank) {
+    const bool biased = rank >= params.protect;
     float best = -numeric_limits<float>::infinity();
     uint best_slot = 0;
     for (uint slot = 0; slot < ExpertsPerLane; ++slot) {
-      if (lane_scores[slot] > best) {
-        best = lane_scores[slot];
+      const float value =
+          biased ? lane_scores[slot] + lane_bias[slot] : lane_scores[slot];
+      if (value > best) {
+        best = value;
         best_slot = slot;
       }
     }
@@ -75,10 +89,12 @@ inline void moe_route_select(device const float *scores, device bfloat *input,
     const uint candidate =
         best == row_best ? simd_lane + 32 * best_slot : 0xFFFFFFFFu;
     const uint winner = simd_min(candidate);
+    const float winner_score =
+        simd_broadcast(lane_scores[best_slot], ushort(winner & 31u));
     if (candidate == winner)
       lane_scores[best_slot] = -numeric_limits<float>::infinity();
     if (simd_lane == 0) {
-      ordered[rank] = row_best;
+      ordered[rank] = biased ? winner_score : row_best;
       selected[row_routes + rank] = winner;
     }
   }
@@ -105,7 +121,8 @@ inline void moe_route_select(device const float *scores, device bfloat *input,
       device const float *shared_gate [[buffer(2)]],                           \
       device uint *selected [[buffer(3)]],                                     \
       device float *routing_weights [[buffer(4)]],                             \
-      constant MoeRouteParams &params [[buffer(5)]],                           \
+      device const float *route_bias [[buffer(5)]],                            \
+      constant MoeRouteParams &params [[buffer(6)]],                           \
       uint group [[threadgroup_position_in_grid]],                             \
       uint thread_index [[thread_index_in_threadgroup]],                       \
       uint simd_lane [[thread_index_in_simdgroup]],                            \
@@ -114,9 +131,9 @@ inline void moe_route_select(device const float *scores, device bfloat *input,
     threadgroup float ordered[Slots];                                          \
     threadgroup float scalar_partials[Slots / 32];                             \
     moe_route_select<Slots>(scores, input, shared_gate, selected,              \
-                            routing_weights, params, group, thread_index,      \
-                            simd_lane, simd_group, row_scores, ordered,        \
-                            scalar_partials);                                  \
+                            routing_weights, route_bias, params, group,        \
+                            thread_index, simd_lane, simd_group, row_scores,   \
+                            ordered, scalar_partials);                         \
   }
 MOE_ROUTE_SELECT_ENTRY(moe_route_select_f32, SPLASH_MOE_EXPERT_SLOTS)
 MOE_ROUTE_SELECT_ENTRY(moe_route_select_f32_e512, SPLASH_MOE_WIDE_EXPERT_SLOTS)

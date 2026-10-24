@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <mutex>
@@ -32,7 +33,32 @@ constexpr uint32_t kNoSlot = UINT32_MAX;
 // at 7.25 GB/s from four threads and at 7.41 GB/s from eighteen, but each
 // then takes 276 us instead of 1223 us.
 constexpr uint64_t kAheadPieceBytes = 512 << 10;
-constexpr unsigned kAheadReaders = 4;
+constexpr unsigned kAheadReadersDefault = 4;
+// FORK experiments (defaults = upstream behaviour):
+// - SPLASH_SYNC_PIECE_KIB splits a decode step's synchronous miss
+//   reads into smaller pieces for queue depth (unset/0 = kLoadStepBytes).
+//   Measured on an M5 Air (512 GB SSD): 128 KiB = no change.
+// - SPLASH_AHEAD_READERS sets the read-ahead's reader threads (4).
+uint64_t syncPieceBytes() noexcept {
+  static const uint64_t bytes = [] {
+    if (const char *value = std::getenv("SPLASH_SYNC_PIECE_KIB")) {
+      const uint64_t kib = std::strtoull(value, nullptr, 10);
+      if (kib) return std::max<uint64_t>(kib << 10, 16 << 10);
+    }
+    return uint64_t{4 << 20};
+  }();
+  return bytes;
+}
+unsigned aheadReaders() noexcept {
+  static const unsigned readers = [] {
+    if (const char *value = std::getenv("SPLASH_AHEAD_READERS")) {
+      const unsigned n = static_cast<unsigned>(std::strtoul(value, nullptr, 10));
+      if (n) return std::min(n, kSsdReaders);
+    }
+    return kAheadReadersDefault;
+  }();
+  return readers;
+}
 // Apple silicon's pages: a read the kernel does straight into memory
 // (F_NOCACHE without the buffer cache) starts and ends on them in the file
 // and in memory. With its ends elsewhere it goes through the buffer cache:
@@ -339,6 +365,19 @@ struct ExpertStore::Impl {
     ExpertStoreStats::Use *use = nullptr;
   } plan;
   uint64_t arenaTotal = 0;
+  // FORK (cache-aware routing): the selection-only route bias (ops::MoE::addRoutes), a
+  // float per block and expert: -biasDelta while the expert is not resident
+  // in the block, 0 while it is; empty without SPLASH_ROUTE_BIAS. Written
+  // under `mutex` by the loads, read by the GPU's later routing.
+  metal::MetalBuffer bias;
+  std::vector<metal::MetalBuffer> biasViews;
+  float biasDelta = 0;
+  uint32_t biasProtect = 6;
+  bool biasPrefill = false; // SPLASH_ROUTE_BIAS_PREFILL=1: prefill routes with the bias too
+  void setBias(uint32_t block, uint32_t expert, bool resident) noexcept {
+    if (!bias) return;
+    static_cast<float *>(bias.contents())[uint64_t{block} * shape.experts + expert] = resident ? 0.0F : -biasDelta;
+  }
 
   // A load and release() or restore(), which never overlap (no command is in
   // flight while the store releases or restores its memory), hand the state
@@ -379,6 +418,7 @@ void ExpertStore::Impl::evict(Size &size, uint32_t slot) {
   if (owner == kNoSlot) return;
   const uint32_t expert = size.ownerExpert[slot];
   blocks[owner].slot[expert] = kNoSlot;
+  setBias(owner, expert, false);
   // A table entry of no resident expert names slot 0, which is inside the
   // arena: the kernels read only routed experts' entries, which a load set,
   // so it is never used.
@@ -421,6 +461,7 @@ void ExpertStore::Impl::route(uint32_t index, std::span<const std::span<const Mo
     block.slot[expert] = slot;
     table[expert] = slot;
     waiting[expert] = 1;
+    setBias(index, expert, true);
     ++counters.resident;
   }
   use.read += pending.size();
@@ -536,7 +577,7 @@ void ExpertStore::Impl::stage(uint32_t index, uint32_t capacity, ExpertStoreStat
            pending[at + count].first == pending[at].first + count && waiting[pending[at + count].first] &&
            place + count < places.count && !taken[place + count])
       ++count;
-    const Group &group = addGroup(now, index, pending[at].first, count, place, places, kLoadStepBytes);
+    const Group &group = addGroup(now, index, pending[at].first, count, place, places, syncPieceBytes());
     for (uint32_t k = 0; k < count; ++k) {
       taken[place + k] = 1;
       addJob(group, k);
@@ -629,7 +670,7 @@ void ExpertStore::Impl::startAhead() {
           const Piece &piece = ahead.reads.pieces[task];
           readPiece(ahead.reads.groups[piece.group], piece);
         },
-        kAheadReaders);
+        aheadReaders());
   } catch (const std::exception &error) {
     plan.block = kNoSlot;
     if (failure.empty()) failure = std::string("reading experts ahead failed: ") + error.what();
@@ -682,6 +723,7 @@ void ExpertStore::Impl::abandon() {
       waiting[expert] = 0;
       if (slot == kNoSlot || block.slot[expert] != slot) continue;
       block.slot[expert] = kNoSlot;
+      setBias(pendingBlock, expert, false);
       table[expert] = 0;
       size.ownerBlock[slot] = size.ownerExpert[slot] = kNoSlot;
       size.recycling.free(slot);
@@ -722,6 +764,7 @@ void ExpertStore::Impl::fill() {
         size.ownerExpert[slot] = slot;
         block.slot[slot] = slot;
         table[slot] = slot;
+        setBias(index, slot, true);
       }
       auto *threadgroups = static_cast<uint32_t *>(grid.contents());
       threadgroups[0] = size.loadGroups;
@@ -943,6 +986,23 @@ ExpertStore::ExpertStore(metal::MetalBackend &backend, StreamedBlocks streamed, 
                                         "experts/sources");
   impl.grid = backend.allocateBuffer(4 * sizeof(uint32_t), metal::BufferStorage::Shared, "experts/grid");
   std::memset(impl.grid.contents(), 0, 4 * sizeof(uint32_t));
+  // FORK (cache-aware routing): SPLASH_ROUTE_BIAS=delta (logit units) enables the
+  // selection-only route bias, SPLASH_ROUTE_PROTECT the ranks chosen by raw
+  // score before it applies (default 6 of the top-k).
+  if (const char *value = std::getenv("SPLASH_ROUTE_BIAS")) impl.biasDelta = std::strtof(value, nullptr);
+  if (const char *value = std::getenv("SPLASH_ROUTE_PROTECT"))
+    impl.biasProtect = static_cast<uint32_t>(std::strtoul(value, nullptr, 10));
+  if (const char *value = std::getenv("SPLASH_ROUTE_BIAS_PREFILL")) impl.biasPrefill = std::strtoul(value, nullptr, 10) != 0;
+  if (impl.biasDelta > 0 && impl.biasProtect < shape.expertsPerToken) {
+    const uint64_t biasValues = uint64_t{blocks} * shape.experts;
+    impl.bias = backend.allocateBuffer(biasValues * sizeof(float), metal::BufferStorage::Shared, "experts/route-bias");
+    std::fill_n(static_cast<float *>(impl.bias.contents()), biasValues, -impl.biasDelta);
+    for (uint32_t block = 0; block < blocks; ++block)
+      impl.biasViews.push_back(backend.view(impl.bias, uint64_t{block} * shape.experts * sizeof(float),
+                                            uint64_t{shape.experts} * sizeof(float)));
+  } else {
+    impl.biasDelta = 0;
+  }
   impl.routedIn.assign(shape.experts, 0);
   impl.waiting.assign(shape.experts, 0);
   impl.counters.arenaBytes = impl.arenaTotal;
@@ -977,6 +1037,12 @@ void ExpertStore::bind(uint32_t block, ops::BlockMoeWeights &weights) {
   weights.slotTable = impl.backend.view(impl.tables, uint64_t{block} * impl.shape.experts * sizeof(uint32_t),
                                         uint64_t{impl.shape.experts} * sizeof(uint32_t));
   weights.slots = size.slots;
+  // FORK (cache-aware routing): a streamed block's decode routing reads its route bias.
+  if (impl.bias && impl.streams(block)) {
+    weights.routeBias = impl.biasViews[block];
+    weights.routeProtect = impl.biasProtect;
+    weights.routeBiasPrefill = impl.biasPrefill;
+  }
   // The experts of a size of one block stay in their slots: nothing loads
   // them.
   weights.stream = impl.streams(block) ? this : nullptr;
@@ -1011,7 +1077,8 @@ void ExpertStore::addLoad(metal::CommandGraph &graph, std::span<const ops::MoeLo
     const Impl::Block &next = impl.blocks[block + 1];
     ops::MoE::addRoutes(graph, parts.front().buffers->input, next.router, next.scalarGate, impl.predictionScores,
                         impl.predictionRoutes, impl.predictionWeights, rows, shape,
-                        parts.front().plan->configuration().ggufRouterTile);
+                        parts.front().plan->configuration().ggufRouterTile,
+                        impl.bias ? impl.biasViews[block + 1] : metal::MetalBuffer{}, impl.biasProtect);
   }
   // A decode step's loads keep the GPU awake: they come about every
   // millisecond and most end within one, about as long as an idle GPU takes
@@ -1073,6 +1140,8 @@ void ExpertStore::release() {
   impl.retireAhead();
   impl.ahead.block = impl.plan.block = kNoSlot;
   for (Impl::Block &block : impl.blocks) std::ranges::fill(block.slot, kNoSlot);
+  if (impl.bias)
+    std::fill_n(static_cast<float *>(impl.bias.contents()), impl.bias.sizeBytes() / sizeof(float), -impl.biasDelta);
   std::memset(impl.tables.contents(), 0, impl.tables.sizeBytes());
   for (Impl::Size &size : impl.sizes) {
     impl.backend.releaseMemory(size.arena);

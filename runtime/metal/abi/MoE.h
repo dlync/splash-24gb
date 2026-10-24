@@ -16,15 +16,21 @@
 #define SPLASH_MOE_EXPERT_SLOTS 256u
 #define SPLASH_MOE_WIDE_EXPERT_SLOTS 512u
 
+// FORK (cache-aware routing): ranks below `protect` are chosen by raw score; ranks from it on
+// by score + the block's route bias (buffer 5 of moe_route_select), a
+// selection-only bias: the routing weights come from the raw scores. protect
+// >= top_k is the upstream routing, which never reads the bias.
 struct MoeRouteParams {
   uint32_t rows;
   uint32_t input_size;
   uint32_t experts;
   uint32_t top_k;
+  uint32_t protect;
+  uint32_t padding;
 };
 
-static_assert(sizeof(MoeRouteParams) == 16,
-              "MoE routing parameters are 16 bytes on both sides");
+static_assert(sizeof(MoeRouteParams) == 24,
+              "MoE routing parameters are 24 bytes on both sides");
 
 // Every row carries top_k routed experts followed by the shared expert, whose
 // id is `experts` and whose routing weight is the sigmoid of its scalar gate.

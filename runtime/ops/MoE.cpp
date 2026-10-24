@@ -205,7 +205,9 @@ void MoE::addRouting(metal::CommandGraph &graph, const MoeBuffers &buffers,
   for (const MoeScratchField &field : kMoeScratchFields)
     requireBytes(scratch.*field.buffer, required.*field.bytes, field.name);
   addRoutes(graph, buffers.input, weights.router, weights.sharedScalarGate, scratch.groupedInput,
-            scratch.selectedExperts, scratch.routingWeights, rows, shape, plan.configuration().ggufRouterTile);
+            scratch.selectedExperts, scratch.routingWeights, rows, shape, plan.configuration().ggufRouterTile,
+            (plan.phase() == MoePhase::Decode || weights.routeBiasPrefill) ? weights.routeBias : metal::MetalBuffer{},
+            weights.routeProtect);
   // The expert passes launch the live tiles alone, on grids the grouping
   // writes with the tile count. Over every tile a step could fill, a 35B
   // decode step of one lane launched 65 tiles' threadgroups for a median of
@@ -254,15 +256,20 @@ void MoE::addRouted(metal::CommandGraph &graph, const MoeBuffers &buffers,
 void MoE::addRoutes(metal::CommandGraph &graph, const metal::MetalBuffer &input, const QuantizedSegment &router,
                     const QuantizedSegment &sharedScalarGate, const metal::MetalBuffer &scores,
                     const metal::MetalBuffer &selected, const metal::MetalBuffer &routingWeights, uint32_t rows,
-                    MoeShape shape, FloatTile routerTile) {
+                    MoeShape shape, FloatTile routerTile, const metal::MetalBuffer &routeBias, uint32_t protect) {
   // fp32 scores of the F32 router in rows of routerWidth() expert slots, as
   // the select kernel of that width reads.
   const uint32_t width = shape.routerWidth();
   addGgufFloat(graph, input, router, scores, rows, width, 0, FloatOutput::Float32, routerTile);
+  // FORK (cache-aware routing): without a bias every rank is chosen by score and the kernel
+  // never reads buffer 5 (the scores stand in for it); at least rank 0 is
+  // always chosen by score, so ordered[0] stays the row's maximum.
+  const bool biased = static_cast<bool>(routeBias) && protect < shape.expertsPerToken;
+  const uint32_t protectRanks = biased ? std::max<uint32_t>(protect, 1) : shape.expertsPerToken;
   graph.add(routingKernel("moe_route_select_f32", shape),
-            {scores, input, sharedScalarGate.plane0, selected, routingWeights},
-            MoeRouteParams{rows, shape.hiddenSize, shape.experts, shape.expertsPerToken}, {rows, 1, 1},
-            {width, 1, 1});
+            {scores, input, sharedScalarGate.plane0, selected, routingWeights, biased ? routeBias : scores},
+            MoeRouteParams{rows, shape.hiddenSize, shape.experts, shape.expertsPerToken, protectRanks, 0},
+            {rows, 1, 1}, {width, 1, 1});
 }
 
 uint32_t MoE::expertLoadGroups(const MoeExpertLoadParams &params) noexcept {

@@ -39,7 +39,12 @@ inline constexpr uint32_t kPrefillRows = ExecutionLimits::prefillTokenBudget;
 // layer to layer once per chunk (prefillGroupTensor), and requests that
 // arrive while it runs wait for the whole command: four chunks read a layer
 // once per 8192 rows and keep both bounded.
-inline constexpr uint32_t kPrefillGroupChunks = 4;
+// FORK: build-time override (-DSPLASH_PREFILL_GROUP_CHUNKS=8) to try larger
+// groups; the default is upstream's four.
+#ifndef SPLASH_PREFILL_GROUP_CHUNKS
+#define SPLASH_PREFILL_GROUP_CHUNKS 4
+#endif
+inline constexpr uint32_t kPrefillGroupChunks = SPLASH_PREFILL_GROUP_CHUNKS;
 inline constexpr uint32_t kTileRows = kv::kPageTokens;
 inline constexpr uint32_t kRaggedAttentionRows =
     kPrefillRows + kLaneCount * (kTileRows - 1);
