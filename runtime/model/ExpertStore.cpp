@@ -440,6 +440,8 @@ struct ExpertStore::Impl {
   std::vector<std::span<const MoeTileDescriptor>> partTiles;
   // The load that last routed each expert of the block being loaded.
   std::vector<uint64_t> routedIn;
+  // FORK (trace and log data): the serial of the load that last missed each expert.
+  std::vector<uint64_t> missIn;
   std::string failure;
   ExpertStoreStats counters;
   mutable std::mutex statsMutex;
@@ -479,7 +481,8 @@ void ExpertStore::Impl::route(uint32_t index, std::span<const std::span<const Mo
   ++serial;
   pendingBlock = index;
   FILE *const trace = routeTrace();
-  if (trace) std::fprintf(trace, "%u %c %u", index, phase == ops::MoePhase::Decode ? 'D' : 'P', rows);
+  std::string traceLine;
+  if (trace) traceLine = std::to_string(index) + (phase == ops::MoePhase::Decode ? " D " : " P ") + std::to_string(rows);
   for (std::span<const MoeTileDescriptor> tiles : parts)
     for (const MoeTileDescriptor &tile : tiles) {
       // Past the routed experts' tiles come the shared expert's (id experts).
@@ -489,13 +492,17 @@ void ExpertStore::Impl::route(uint32_t index, std::span<const std::span<const Mo
       ++use.routed;
       if (const uint32_t slot = block.slot[expert]; slot != kNoSlot) {
         size.recycling.touch(slot, serial, chunk);
-        if (trace) std::fprintf(trace, " +%u", expert);
+        if (trace) traceLine += " +" + std::to_string(expert);
         continue;
       }
-      if (trace) std::fprintf(trace, " -%u", expert);
+      missIn[expert] = serial;
+      if (trace) traceLine += " -" + std::to_string(expert);
       pending.push_back({expert, kNoSlot});
     }
-  if (trace) std::fputc('\n', trace);
+  if (trace) {
+    traceLine += '\n';
+    std::fputs(traceLine.c_str(), trace);
+  }
   // Consecutive experts read together (stage).
   std::ranges::sort(pending);
   uint32_t *table = static_cast<uint32_t *>(tables.contents()) + uint64_t{index} * shape.experts;
@@ -578,6 +585,7 @@ void ExpertStore::Impl::stage(uint32_t index, uint32_t capacity, ExpertStoreStat
   // places of the others.
   const std::vector<Piece> &aheadPieces = ahead.reads.pieces;
   const SsdReaders::Batch *batch = ahead.batch.get();
+  uint32_t wholeAhead = 0;  // FORK (trace and log data): read-ahead groups staged whole
   const auto reading = [&](size_t piece) { return piece < batch->taken() && !batch->ended(piece); };
   for (size_t piece = 0, end = 0; batch && piece < aheadPieces.size(); piece = end) {
     const uint32_t at = aheadPieces[piece].group;
@@ -605,9 +613,14 @@ void ExpertStore::Impl::stage(uint32_t index, uint32_t capacity, ExpertStoreStat
         whole = false;
       }
     use.prefetched += whole;
+    wholeAhead += whole;
     addJob(now.groups.back(), 0);
   }
   const uint64_t left = std::ranges::count_if(pending, [&](const auto &entry) { return waiting[entry.first]; });
+  // FORK (trace and log data): "S block aheadRouted aheadWhole unpredicted" per round.
+  if (FILE *trace = routeTrace())
+    std::fprintf(trace, "S %u %u %u %llu\n", index, static_cast<unsigned>(now.groups.size()), wholeAhead,
+                 static_cast<unsigned long long>(left));
   const uint64_t due = std::max<uint64_t>(staged.size(), std::min<uint64_t>(capacity, staged.size() + left));
   uint32_t place = 0;
   for (size_t at = 0; at < pending.size() && staged.size() < due;) {
@@ -705,6 +718,9 @@ void ExpertStore::Impl::startAhead() {
       // are the likeliest; a piece starts on a page and so ends on one.
       addGroup(ahead.reads, plan.block, expert, 1, place++, places, kAheadPieceBytes);
     }
+    // FORK (trace and log data): "H block planned issued" per read-ahead.
+    if (FILE *trace = routeTrace())
+      std::fprintf(trace, "H %u %zu %zu\n", plan.block, plan.experts.size(), ahead.reads.groups.size());
     const uint32_t block = std::exchange(plan.block, kNoSlot);
     if (ahead.reads.groups.empty()) return;
     ahead.block = block;
@@ -914,7 +930,15 @@ void ExpertStore::Impl::logHidden(uint32_t index, uint32_t rows, bool predicted,
   const auto *x = static_cast<const uint16_t *>(input.contents());
   for (const uint32_t row : live) std::fwrite(x + uint64_t{row} * hidden, sizeof(uint16_t), hidden, log.file);
   const auto *selected = static_cast<const uint32_t *>(routes.contents());
-  for (const uint32_t row : live) std::fwrite(selected + uint64_t{row} * routesPerRow, sizeof(uint32_t), topk, log.file);
+  // Bit 31 marks a routed expert this load missed (v2 logs).
+  std::vector<uint32_t> marked(topk);
+  for (const uint32_t row : live) {
+    for (uint32_t k = 0; k < topk; ++k) {
+      const uint32_t expert = selected[uint64_t{row} * routesPerRow + k];
+      marked[k] = expert | (expert < shape.experts && missIn[expert] == serial ? 0x80000000u : 0u);
+    }
+    std::fwrite(marked.data(), sizeof(uint32_t), topk, log.file);
+  }
   const auto *guess = predicted ? static_cast<const uint32_t *>(predictionRoutes.contents()) : nullptr;
   const std::vector<uint32_t> zeros(topk, 0);
   for (const uint32_t row : live)
@@ -1077,6 +1101,7 @@ ExpertStore::ExpertStore(metal::MetalBackend &backend, StreamedBlocks streamed, 
     impl.biasDelta = 0;
   }
   impl.routedIn.assign(shape.experts, 0);
+  impl.missIn.assign(shape.experts, 0);
   impl.waiting.assign(shape.experts, 0);
   impl.counters.arenaBytes = impl.arenaTotal;
   impl.counters.stagingBytes = impl.staging.sizeBytes();
