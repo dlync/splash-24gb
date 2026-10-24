@@ -25,8 +25,9 @@ inline void moe_gguf_expert_tile(device bfloat *input, device const MoeTileDescr
                                  uint2 group, uint simd_lane, uint simd_group, threadgroup half *stage,
                                  threadgroup half2 *tl) {
   if (group.y >= *tile_count) return;
-  // FORK (desk-first): a pass over a range of the live tiles.
-  if (group.y < p.tile_begin || (p.tile_limit && group.y >= p.tile_limit)) return;
+  // FORK (desk-first): a pass over a range of the live tiles; MOE_TILE_BEGIN_RESIDENT starts past the resident ones.
+  const uint begin = p.tile_begin == MOE_TILE_BEGIN_RESIDENT ? tile_count[MOE_TILE_COUNT_RESIDENT_INDEX] : p.tile_begin;
+  if (group.y < begin || (p.tile_limit && group.y >= p.tile_limit)) return;
   const MoeTileDescriptor tile = tiles[group.y];
   const MoeGgufSegment s = moe_gguf_segment(tile.expert, p, slots, w0, w1, meta, sw0, sw1, smeta);
   device bfloat *x = input + ulong(group.y) * Rows * p.input_size;
@@ -132,8 +133,9 @@ kernel void moe_expert_gguf_gate_up(device bfloat *input [[buffer(0)]],
                                     uint simd_group [[simdgroup_index_in_threadgroup]]) {
   threadgroup half stage[kStagedStages]; threadgroup half2 tl[Tables * kQuantPairTableEntries];
   if (group.y >= *tile_count) return;
-  // FORK (desk-first): a pass over a range of the live tiles.
-  if (group.y < p.tile_begin || (p.tile_limit && group.y >= p.tile_limit)) return;
+  // FORK (desk-first): a pass over a range of the live tiles; MOE_TILE_BEGIN_RESIDENT starts past the resident ones.
+  const uint begin = p.tile_begin == MOE_TILE_BEGIN_RESIDENT ? tile_count[MOE_TILE_COUNT_RESIDENT_INDEX] : p.tile_begin;
+  if (group.y < begin || (p.tile_limit && group.y >= p.tile_limit)) return;
   const MoeTileDescriptor tile = tiles[group.y];
   const bool up = simd_group == 1;
   const MoeGgufSegment gs = moe_gguf_segment(tile.expert, p.experts, p.input_size, p.output_size, p.gate_routed_format,

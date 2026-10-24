@@ -244,9 +244,152 @@ inline void moe_group_routes_phase(
   if (thread_index == 0) {
     const uint live = routed_tiles + shared_tiles;
     *tile_count = MoeTileCount{live, {params.gate_up_columns, live, 1},
-                               {params.down_columns, live, 1}};
+                               {params.down_columns, live, 1}, 0u, {0u, 0u, 0u}, {0u, 0u, 0u}};
   }
 }
+
+// FORK (desk-first): a grouping whose tiles come in three runs: the
+// routed experts resident in the block's slot table (slots[e] != MOE_NO_SLOT,
+// as the host left it before this step), the shared expert's tiles, then the
+// routed experts the host still has to load. It writes resident_tiles (the
+// first two runs) and the grids of a pass over them alone (MoeTileCount), so
+// the expert passes can run the resident tiles before the load and the rest
+// after it. Tiles, routes and rows are the same as moe_group_routes_phase's,
+// only in another order; the combine sums by route, not tile.
+template <uint Slots, bool Verified>
+inline void moe_group_routes_resident_phase(
+    device const uint *selected, device MoeTileDescriptor *tiles, device MoeTileCount *tile_count,
+    device uint *grouped_routes, device uint *route_rows, device const uint *verify_rows, device const uint *slots,
+    constant MoeGroupParams &params, uint thread_index, uint simd_lane, uint simd_group,
+    threadgroup atomic_uint *counts, threadgroup atomic_uint *cursors, threadgroup uint *tile_offsets,
+    threadgroup uint *simd_totals, threadgroup uint *simd_totals_missing) {
+  const uint routes_per_row = params.top_k + 1;
+  const uint routes = params.rows * routes_per_row;
+  atomic_store_explicit(&counts[thread_index], 0u, memory_order_relaxed);
+  atomic_store_explicit(&cursors[thread_index], 0u, memory_order_relaxed);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint route = thread_index; route < routes; route += Slots) {
+    if (route % routes_per_row != params.top_k &&
+        !moe_unverified_route<Verified>(verify_rows, params, route)) {
+      atomic_fetch_add_explicit(&counts[selected[route]], 1u,
+                                memory_order_relaxed);
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  const uint count = atomic_load_explicit(&counts[thread_index], memory_order_relaxed);
+  const uint expert_tiles = (count + params.tile_rows - 1) / params.tile_rows;
+  const bool resident = slots[thread_index] != MOE_NO_SLOT;
+  const uint mine_resident = resident ? expert_tiles : 0u, mine_missing = resident ? 0u : expert_tiles;
+  const uint prefix_resident = simd_prefix_exclusive_sum(mine_resident);
+  const uint prefix_missing = simd_prefix_exclusive_sum(mine_missing);
+  if (simd_lane == 31) {
+    simd_totals[simd_group] = prefix_resident + mine_resident;
+    simd_totals_missing[simd_group] = prefix_missing + mine_missing;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  uint resident_routed = 0, missing_routed = 0;
+  uint before_resident = prefix_resident, before_missing = prefix_missing;
+  for (uint group = 0; group < Slots / 32; ++group) {
+    if (group < simd_group) {
+      before_resident += simd_totals[group];
+      before_missing += simd_totals_missing[group];
+    }
+    resident_routed += simd_totals[group];
+    missing_routed += simd_totals_missing[group];
+  }
+  const uint shared_tiles = (params.rows + params.tile_rows - 1) / params.tile_rows;
+  const uint resident_tiles = resident_routed + shared_tiles;
+  const uint tile_offset = resident ? before_resident : resident_tiles + before_missing;
+  tile_offsets[thread_index] = tile_offset;
+  for (uint tile = 0; tile < expert_tiles; ++tile) {
+    tiles[tile_offset + tile] = MoeTileDescriptor{
+        thread_index, min(params.tile_rows, count - tile * params.tile_rows)};
+  }
+  if (expert_tiles) {
+    const uint last = tile_offset + expert_tiles - 1;
+    const uint live = count - (expert_tiles - 1) * params.tile_rows;
+    for (uint row = tile_offset * params.tile_rows + count;
+         row < last * params.tile_rows + moe_matmul_rows(live, params.tile_rows);
+         ++row)
+      grouped_routes[row] = ~0u;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint route = thread_index; route < routes; route += Slots) {
+    if (route % routes_per_row == params.top_k)
+      continue;
+    if (moe_unverified_route<Verified>(verify_rows, params, route)) {
+      route_rows[route] = ~0u;
+      continue;
+    }
+    uint expert = selected[route];
+    uint slot =
+        atomic_fetch_add_explicit(&cursors[expert], 1u, memory_order_relaxed);
+    uint row = tile_offsets[expert] * params.tile_rows + slot;
+    grouped_routes[row] = route;
+    route_rows[route] = row;
+  }
+
+  // The shared expert's tiles follow the resident routed ones.
+  const uint shared_base = resident_routed * params.tile_rows;
+  const uint shared_rows =
+      (shared_tiles - 1) * params.tile_rows +
+      moe_matmul_rows(params.rows - (shared_tiles - 1) * params.tile_rows,
+                      params.tile_rows);
+  for (uint tile = thread_index; tile < shared_tiles; tile += Slots) {
+    tiles[resident_routed + tile] = MoeTileDescriptor{
+        params.experts,
+        min(params.tile_rows, params.rows - tile * params.tile_rows)};
+  }
+  for (uint row = thread_index; row < shared_rows; row += Slots) {
+    if (row < params.rows) {
+      uint route = row * routes_per_row + params.top_k;
+      grouped_routes[shared_base + row] = route;
+      route_rows[route] = shared_base + row;
+    } else {
+      grouped_routes[shared_base + row] = ~0u;
+    }
+  }
+  if (thread_index == 0) {
+    const uint live = resident_tiles + missing_routed;
+    *tile_count = MoeTileCount{live, {params.gate_up_columns, live, 1},
+                               {params.down_columns, live, 1}, resident_tiles,
+                               {params.gate_up_columns, resident_tiles, 1},
+                               {params.down_columns, resident_tiles, 1}};
+  }
+}
+
+#define MOE_GROUP_ROUTES_RESIDENT_BODY(Slots, Verified, verify_rows)           \
+    threadgroup atomic_uint counts[Slots];                                     \
+    threadgroup atomic_uint cursors[Slots];                                    \
+    threadgroup uint tile_offsets[Slots];                                      \
+    threadgroup uint simd_totals[Slots / 32];                                  \
+    threadgroup uint simd_totals_missing[Slots / 32];                          \
+    moe_group_routes_resident_phase<Slots, Verified>(                          \
+        selected, tiles, tile_count, grouped_routes, route_rows, verify_rows,  \
+        slots, params, thread_index, simd_lane, simd_group, counts, cursors,   \
+        tile_offsets, simd_totals, simd_totals_missing);
+// FORK (desk-first): the verified grouping, resident experts' tiles first; the
+// block's slot table at buffer 6.
+#define MOE_GROUP_ROUTES_VERIFIED_RESIDENT_ENTRY(Name, Slots)                  \
+  kernel void Name(                                                            \
+      device const uint *selected [[buffer(0)]],                               \
+      device MoeTileDescriptor *tiles [[buffer(1)]],                           \
+      device MoeTileCount *tile_count [[buffer(2)]],                           \
+      device uint *grouped_routes [[buffer(3)]],                               \
+      device uint *route_rows [[buffer(4)]],                                   \
+      device const uint *verify_rows [[buffer(5)]],                            \
+      device const uint *slots [[buffer(6)]],                                  \
+      constant MoeGroupParams &params [[buffer(7)]],                           \
+      uint thread_index [[thread_index_in_threadgroup]],                       \
+      uint simd_lane [[thread_index_in_simdgroup]],                            \
+      uint simd_group [[simdgroup_index_in_threadgroup]]) {                    \
+    MOE_GROUP_ROUTES_RESIDENT_BODY(Slots, true, verify_rows)                   \
+  }
+MOE_GROUP_ROUTES_VERIFIED_RESIDENT_ENTRY(moe_group_routes_verified_resident, SPLASH_MOE_EXPERT_SLOTS)
+MOE_GROUP_ROUTES_VERIFIED_RESIDENT_ENTRY(moe_group_routes_verified_resident_e512, SPLASH_MOE_WIDE_EXPERT_SLOTS)
+#undef MOE_GROUP_ROUTES_VERIFIED_RESIDENT_ENTRY
+#undef MOE_GROUP_ROUTES_RESIDENT_BODY
 
 #define MOE_GROUP_ROUTES_BODY(Slots, Verified, verify_rows)                    \
     threadgroup atomic_uint counts[Slots];                                     \

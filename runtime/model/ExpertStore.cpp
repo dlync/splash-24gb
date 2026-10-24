@@ -497,10 +497,10 @@ void ExpertStore::Impl::evict(Size &size, uint32_t slot) {
   const uint32_t expert = size.ownerExpert[slot];
   blocks[owner].slot[expert] = kNoSlot;
   setBias(owner, expert, false);
-  // A table entry of no resident expert names slot 0, which is inside the
-  // arena: the kernels read only routed experts' entries, which a load set,
-  // so it is never used.
-  static_cast<uint32_t *>(tables.contents())[uint64_t{owner} * shape.experts + expert] = 0;
+  // A table entry of no resident expert is kNoSlot: the expert passes read
+  // only routed experts' entries, which a load set, and the resident-first
+  // grouping (FORK, desk-first) tests entries for it.
+  static_cast<uint32_t *>(tables.contents())[uint64_t{owner} * shape.experts + expert] = kNoSlot;
   size.ownerBlock[slot] = size.ownerExpert[slot] = kNoSlot;
   --counters.resident;
 }
@@ -835,7 +835,7 @@ void ExpertStore::Impl::abandon() {
       if (slot == kNoSlot || block.slot[expert] != slot) continue;
       block.slot[expert] = kNoSlot;
       setBias(pendingBlock, expert, false);
-      table[expert] = 0;
+      table[expert] = kNoSlot;
       size.ownerBlock[slot] = size.ownerExpert[slot] = kNoSlot;
       size.recycling.free(slot);
       --counters.resident;
@@ -1115,7 +1115,8 @@ ExpertStore::ExpertStore(metal::MetalBackend &backend, StreamedBlocks streamed, 
   impl.staging = backend.allocateBuffer(impl.places.bytes(), metal::BufferStorage::Shared, "experts/staging");
   const uint64_t tableBytes = uint64_t{shape.experts} * impl.blocks.size() * sizeof(uint32_t);
   impl.tables = backend.allocateBuffer(tableBytes, metal::BufferStorage::Shared, "experts/slot-tables");
-  std::memset(impl.tables.contents(), 0, tableBytes);
+  // FORK (desk-first): every entry kNoSlot (0xFFFFFFFF) until a load sets it.
+  std::memset(impl.tables.contents(), 0xFF, tableBytes);
   const auto predictionBuffer = [&](uint64_t perRow, const char *label) {
     return backend.allocateBuffer(uint64_t{kCycleRows} * perRow * sizeof(float),
                                   metal::BufferStorage::Shared, label);
@@ -1297,7 +1298,7 @@ void ExpertStore::release() {
   for (Impl::Block &block : impl.blocks) std::ranges::fill(block.slot, kNoSlot);
   if (impl.bias)
     std::fill_n(static_cast<float *>(impl.bias.contents()), impl.bias.sizeBytes() / sizeof(float), -impl.biasDelta);
-  std::memset(impl.tables.contents(), 0, impl.tables.sizeBytes());
+  std::memset(impl.tables.contents(), 0xFF, impl.tables.sizeBytes());
   for (Impl::Size &size : impl.sizes) {
     impl.backend.releaseMemory(size.arena);
     std::ranges::fill(size.ownerBlock, kNoSlot);

@@ -91,10 +91,25 @@ struct MoeTileCount {
   uint32_t tiles;
   uint32_t gate_up_grid[3];
   uint32_t down_grid[3];
+  // FORK (desk-first): a resident-first grouping
+  // (moe_group_routes_verified_resident*) puts the tiles of experts whose
+  // slot table entry is not MOE_NO_SLOT, and the shared expert's, first:
+  // their count and the grids of a pass over them alone. Other groupings
+  // leave these 0.
+  uint32_t resident_tiles;
+  uint32_t resident_gate_up_grid[3];
+  uint32_t resident_down_grid[3];
 };
 
-static_assert(sizeof(MoeTileCount) == 28,
-              "the MoE tile count is 28 bytes on both sides");
+static_assert(sizeof(MoeTileCount) == 56,
+              "the MoE tile count is 56 bytes on both sides");
+
+// FORK (desk-first): a slot table entry of no resident expert (kNoSlot on the
+// host); the index of MoeTileCount::resident_tiles in uints; and the
+// MoeGgufExpertParams::tile_begin that means "from resident_tiles on".
+#define MOE_NO_SLOT 0xFFFFFFFFu
+#define MOE_TILE_COUNT_RESIDENT_INDEX 7u
+#define MOE_TILE_BEGIN_RESIDENT 0xFFFFFFFFu
 
 struct MoeGatherParams {
   uint32_t tile_rows;

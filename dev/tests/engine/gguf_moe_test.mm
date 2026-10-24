@@ -33,6 +33,8 @@
 //   skewed router loads on the staged 32-row tiles of one format, at ragged
 //   row counts. A verify step that routes its lanes' verify rows alone.
 // Streamed experts (model::ExpertStore) run in expert_store_test.mm.
+#include <cstdlib>
+
 #include "../../../runtime/metal/CommandGraph.hpp"
 #include "../../../runtime/metal/MetalBackend.hpp"
 #include "../../../runtime/ops/Linear.hpp"
@@ -654,18 +656,21 @@ MoeRun runPlan(MetalBackend &backend, const Model &m, Buffers &b, const MoePlan 
   // in one pass (_gate_up, _gate_up_mixed where their formats differ) or as
   // the gate and up passes (_a, then _g).
   uint32_t gateUpPasses = 0, upPasses = 0;
+  // FORK (desk-first): SPLASH_SPLIT_TAIL / SPLASH_DESK_FIRST run the passes as
+  // two tile ranges; the grid and pass-count checks apply to the plain layout.
+  const bool split = std::getenv("SPLASH_SPLIT_TAIL") || std::getenv("SPLASH_DESK_FIRST");
   for (const ComputeDispatch &dispatch : graph.dispatches()) {
     const uint32_t *grid = nullptr;
     if (const MetalBuffer &buffer = dispatch.indirectThreadgroups.buffer)
       grid = static_cast<const uint32_t *>(buffer.contents()) + dispatch.indirectThreadgroups.offsetBytes / 4;
-    require(dispatch.pipelineName.starts_with("moe_expert_gguf") == (grid != nullptr) &&
-                (!grid || (grid[0] == dispatch.threadgroups.x && grid[1] == tiles && grid[2] == 1 &&
-                           dispatch.threadgroups.y == plan.maximumTiles())),
+    require(split || (dispatch.pipelineName.starts_with("moe_expert_gguf") == (grid != nullptr) &&
+                      (!grid || (grid[0] == dispatch.threadgroups.x && grid[1] == tiles && grid[2] == 1 &&
+                                 dispatch.threadgroups.y == plan.maximumTiles()))),
             label + ": " + dispatch.pipelineName + " runs another grid than its live tiles");
     gateUpPasses += dispatch.pipelineName.ends_with("_gate_up") || dispatch.pipelineName.ends_with("_gate_up_mixed");
     upPasses += dispatch.pipelineName.ends_with("_g");
   }
-  require(gateUpPasses == staged && upPasses == !staged,
+  require(split ? (gateUpPasses >= staged && upPasses >= !staged) : (gateUpPasses == staged && upPasses == !staged),
           label + (staged ? ": gate and up run in two passes" : ": gate and up run in one pass"));
   for (uint32_t r = 0; r < rows; ++r) {
     const float *x = b.input.data() + uint64_t{r} * kHidden;

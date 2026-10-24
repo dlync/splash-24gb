@@ -87,6 +87,21 @@ uint32_t splitTailTiles() noexcept {
   return tail;
 }
 
+// FORK (desk-first): SPLASH_DESK_FIRST=1 groups a streamed verify
+// step's resident experts first and runs their tiles in a pass of their own
+// before the missing ones (addRouting, addExperts). Staged tile only.
+bool deskFirstEnabled() noexcept {
+  static const bool enabled = [] {
+    const char *value = std::getenv("SPLASH_DESK_FIRST");
+    return value && *value && *value != '0';
+  }();
+  return enabled;
+}
+bool deskFirst(const MoeBuffers &buffers, const BlockMoeWeights &weights, const MoePlan &plan) noexcept {
+  return deskFirstEnabled() && weights.stream && buffers.verifyRows && plan.phase() == MoePhase::Decode &&
+         plan.configuration().ggufTile == MoeGgufTile::Staged;
+}
+
 // The expert passes over grouped tiles, each on the grid of the live
 // tiles that the grouping wrote (MoeTileCount), within the column tiles of
 // `group` and maximumTiles(): gate and up in one pass into
@@ -96,8 +111,9 @@ uint32_t splitTailTiles() noexcept {
 // read the grouped rows the gather writes into groupedInput, as Table16 tiles
 // on register plans, whose down pass reads the tiles a prepare dispatch
 // writes there.
-void addExperts(metal::CommandGraph &graph, const MoeScratch &scratch, const BlockMoeWeights &weights,
+void addExperts(metal::CommandGraph &graph, const MoeBuffers &buffers, const BlockMoeWeights &weights,
                 const MoePlan &plan, const MoeGroupParams &group) {
+  const MoeScratch &scratch = buffers.scratch;
   const MoeShape shape = plan.shape();
   const uint32_t tiles = plan.maximumTiles();
   const bool table16 = plan.configuration().ggufTile == MoeGgufTile::Register;
@@ -117,10 +133,22 @@ void addExperts(metal::CommandGraph &graph, const MoeScratch &scratch, const Blo
   // same kernels (bit-identical); measures the cost of the split desk-first
   // needs. 0/unset = one pass.
   const uint32_t splitTail = plan.phase() == MoePhase::Decode && !table16 ? splitTailTiles() : 0;
-  // Pass ranges: {begin, limit, static tiles (0 = indirect grid)}.
-  struct Range { uint32_t begin, limit, fixed; };
-  std::vector<Range> ranges{{0, 0, 0}};
-  if (splitTail) ranges = {{splitTail, 0, 0}, {0, splitTail, splitTail}};
+  // Pass ranges: {begin, limit, static tiles (0 = indirect grid), indirect
+  // grids (gate/up, down) for the pass}.
+  struct Range {
+    uint32_t begin, limit, fixed;
+    metal::IndirectGrid gateUp, down;
+  };
+  std::vector<Range> ranges{{0, 0, 0, gateUpGrid, downGrid}};
+  if (splitTail)
+    ranges = {{splitTail, 0, 0, gateUpGrid, downGrid}, {0, splitTail, splitTail, {}, {}}};
+  // FORK (desk-first): the resident tiles [0, resident_tiles) on the
+  // resident grids, then the rest on the live grids (the kernels skip tiles
+  // before resident_tiles: MOE_TILE_BEGIN_RESIDENT).
+  if (deskFirst(buffers, weights, plan))
+    ranges = {{0, 0, 0, {scratch.tileCount, offsetof(MoeTileCount, resident_gate_up_grid)},
+               {scratch.tileCount, offsetof(MoeTileCount, resident_down_grid)}},
+              {MOE_TILE_BEGIN_RESIDENT, 0, 0, gateUpGrid, downGrid}};
   const auto params = [&](const BlockExpertProjection &projection, uint32_t n, uint32_t k, const Range &range) {
     return MoeGgufExpertParams{k, n, shape.experts, projection.routed.formatId, projection.shared.formatId,
                                range.begin, range.limit};
@@ -144,6 +172,8 @@ void addExperts(metal::CommandGraph &graph, const MoeScratch &scratch, const Blo
       graph.add(kernel + (up ? "_g" : "_a"), std::move(bindings), params(projection, n, k, range),
                 {columns, tiles, 1}, grid, {threads, 1, 1});
   };
+  // The resident pass has no tile_limit of its own: its grid (resident_tiles)
+  // bounds it, and the grouping wrote both.
   const uint32_t hidden = shape.hiddenSize;
   const uint32_t intermediate = shape.expertIntermediateSize;
   for (const Range &range : ranges) {
@@ -165,12 +195,12 @@ void addExperts(metal::CommandGraph &graph, const MoeScratch &scratch, const Blo
                   {group.gate_up_columns, range.fixed, 1}, {threads, 1, 1});
       else
         graph.add(kernel + (mixed ? "_gate_up_mixed" : "_gate_up"), std::move(bindings), gateUp,
-                  {group.gate_up_columns, tiles, 1}, gateUpGrid, {threads, 1, 1});
+                  {group.gate_up_columns, tiles, 1}, range.gateUp, {threads, 1, 1});
     } else {
       pass(weights.gate, false, scratch.groupedInput, scratch.expertOutput,
-           intermediate, hidden, group.gate_up_columns, gateUpGrid, range);
+           intermediate, hidden, group.gate_up_columns, range.gateUp, range);
       pass(weights.up, true, scratch.groupedInput, scratch.expertIntermediate,
-           intermediate, hidden, group.gate_up_columns, gateUpGrid, range);
+           intermediate, hidden, group.gate_up_columns, range.gateUp, range);
     }
     if (table16)
       graph.add("moe_prepare_table16",
@@ -179,7 +209,7 @@ void addExperts(metal::CommandGraph &graph, const MoeScratch &scratch, const Blo
                 intermediate, {tiles, (intermediate + 255) / 256, 1});
     pass(weights.down, false,
          table16 ? scratch.groupedInput : scratch.expertIntermediate,
-         scratch.expertOutput, hidden, intermediate, group.down_columns, downGrid, range);
+         scratch.expertOutput, hidden, intermediate, group.down_columns, range.down, range);
   }
 }
 
@@ -255,6 +285,15 @@ void MoE::addRouting(metal::CommandGraph &graph, const MoeBuffers &buffers,
                  "MoE verify rows");
     grouping.push_back(buffers.verifyRows);
   }
+  // FORK (desk-first): a streamed verify step groups the resident
+  // experts' tiles first (moe_group_routes_verified_resident*), reading the
+  // block's slot table; addExperts then runs them before the load's rest.
+  if (deskFirst(buffers, weights, plan)) {
+    grouping.push_back(weights.slotTable);
+    graph.add(routingKernel("moe_group_routes_verified_resident", shape), std::move(grouping), groupParams(plan),
+              {1, 1, 1}, {shape.routerWidth(), 1, 1});
+    return;
+  }
   graph.add(routingKernel(buffers.verifyRows ? "moe_group_routes_verified" : "moe_group_routes", shape),
             std::move(grouping), groupParams(plan), {1, 1, 1}, {shape.routerWidth(), 1, 1});
 }
@@ -277,7 +316,7 @@ void MoE::addRouted(metal::CommandGraph &graph, const MoeBuffers &buffers,
               {buffers.input, scratch.groupedRoutes, scratch.tileDescriptors,
                scratch.tileCount, scratch.groupedInput},
               gather, {tiles, shape.hiddenSize / 256, 1});
-  addExperts(graph, scratch, weights, plan, groupParams(plan));
+  addExperts(graph, buffers, weights, plan, groupParams(plan));
   graph.add("moe_combine",
             {scratch.expertOutput, scratch.routeRows, scratch.routingWeights,
              buffers.residual, buffers.output},
