@@ -1,5 +1,7 @@
 # Splash
 
+> **Fork:** faster SSD expert streaming for MoE models on small Macs. See [FORK.md](FORK.md).
+
 [![CI](https://github.com/incoai/splash/actions/workflows/ci.yml/badge.svg)](https://github.com/incoai/splash/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Apple%20silicon-black.svg)](#quick-start)
