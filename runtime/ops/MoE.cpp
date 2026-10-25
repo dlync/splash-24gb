@@ -146,8 +146,8 @@ void addExperts(metal::CommandGraph &graph, const MoeBuffers &buffers, const Blo
   const metal::IndirectGrid gateUpGrid{scratch.tileCount, offsetof(MoeTileCount, gate_up_grid)};
   const metal::IndirectGrid downGrid{scratch.tileCount, offsetof(MoeTileCount, down_grid)};
   // FORK (split-pass experiment): SPLASH_SPLIT_TAIL=n runs a decode step's staged
-  // expert passes twice, pass A over live tiles [n, ...) on the indirect grid
-  // and pass B over tiles [0, n) on a static grid of n, the same tiles on the
+  // expert passes twice, a first pass over live tiles [n, ...) on the indirect grid
+  // and a second over tiles [0, n) on a static grid of n, the same tiles on the
   // same kernels (bit-identical); measures the cost of the split desk-first
   // needs. 0/unset = one pass.
   const uint32_t splitTail = plan.phase() == MoePhase::Decode && !table16 ? splitTailTiles() : 0;

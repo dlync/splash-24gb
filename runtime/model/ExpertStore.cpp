@@ -47,7 +47,7 @@ uint64_t syncPieceBytes() noexcept {
       const uint64_t kib = std::strtoull(value, nullptr, 10);
       if (kib) return std::max<uint64_t>(kib << 10, 16 << 10);
     }
-    return uint64_t{4 << 20};
+    return kLoadStepBytes;
   }();
   return bytes;
 }
@@ -979,7 +979,7 @@ void ExpertStore::Impl::logHidden(uint32_t index, uint32_t rows, bool predicted,
   const auto *x = static_cast<const uint16_t *>(input.contents());
   for (const uint32_t row : live) std::fwrite(x + uint64_t{row} * hidden, sizeof(uint16_t), hidden, log.file);
   const auto *selected = static_cast<const uint32_t *>(routes.contents());
-  // Bit 31 marks a routed expert this load missed (v2 logs).
+  // Bit 31 marks a routed expert this load missed.
   std::vector<uint32_t> marked(topk);
   for (const uint32_t row : live) {
     for (uint32_t k = 0; k < topk; ++k) {
