@@ -46,8 +46,8 @@ off, with the machine cool. Only ~6,800 of the model's 24,576 experts fit in RAM
 - An M3 or newer Mac, macOS 26.4+.
 - Full Xcode (not just the Command Line Tools), opened once so its licence is accepted.
 - Homebrew Splash **1.4.0**: `brew install incoai/tap/splash`, then check with
-  `splash --version`. The fork has only been tested against 1.4.0; if Homebrew gives you a
-  newer Splash, the fork's engine may not match it.
+  `splash --version`. The fork only supports 1.4.0, and a newer Splash may not match the
+  fork's engine. Run `brew pin splash` so Homebrew doesn't upgrade it under you.
 
 The fork reuses Homebrew Splash's Python server and installer, and your Homebrew install isn't
 changed.
@@ -62,18 +62,21 @@ make -j4                                       # ~3 min
 
 ### 3. Make a separate copy of Splash with the fork's engine
 
-Run this from the `splash-24gb` folder. It's safe to re-run, and you should re-run it after
-rebuilding or after `brew upgrade splash`:
+Run this from the `splash-24gb` folder after building. Stop the fork's server first if it's
+running. It's safe to re-run (do that after each rebuild), and it only ever replaces
+`~/splash-24gb-run`:
 
 ```bash
 FORK=~/splash-24gb-run
 SRC="$(brew --prefix splash)/libexec" && [ -d "$SRC" ] && \
+[ -x build/splash ] && [ -f build/splash.metallib ] && [ -f build/host-step.metallib ] && \
 rm -rf "$FORK" && cp -R "$SRC" "$FORK" && \
 cp build/splash build/splash.metallib build/host-step.metallib "$FORK/engine/" && \
 mkdir -p "$FORK/bin" && \
 printf '#!/bin/sh\nexport PYTHONDONTWRITEBYTECODE=1\nexec "%s/python/bin/python3" -u "%s/install/launcher.py" "$@"\n' \
   "$FORK" "$FORK" > "$FORK/bin/splash" && \
-chmod +x "$FORK/bin/splash" && echo "OK: $FORK/bin/splash"
+chmod +x "$FORK/bin/splash" && echo "OK: $FORK/bin/splash" || \
+echo "FAILED: run this from the splash-24gb folder after 'make', with Homebrew Splash installed"
 ```
 
 ### 4. Run
