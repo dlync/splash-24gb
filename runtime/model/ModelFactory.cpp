@@ -5,6 +5,8 @@
 #include "model/SafetensorsTarget.hpp"
 #include "model/VisionLoader.hpp"
 
+#include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <stdexcept>
 #include <string_view>
@@ -105,7 +107,24 @@ LoadedModel loadModel(metal::MetalBackend &backend,
       },
       result.descriptor.target);
   result.draft = loadDFlashDraftWeights(backend, draft, result.descriptor.draft);
-  result.vision = loadVisionWeights(backend, images, vision.get());
+  // FORK (lazy vision): with SPLASH_LAZY_VISION=1 the tower's image gets
+  // memory of its own, released as soon as it is read, so the memory plan
+  // sees no vision weights (the expert arena is planned as for a
+  // language-only model) and the first start that needs an encode restores
+  // them inside its admission (Runtime.cpp activate).
+  const char *lazyFlag = std::getenv("SPLASH_LAZY_VISION");
+  const bool lazyVision = vision && lazyFlag && *lazyFlag && *lazyFlag != '0';
+  if (lazyVision) {
+    result.visionImages = std::make_shared<WeightImages>(backend, images.contentIdentity());
+    result.vision = loadVisionWeights(backend, *result.visionImages, vision.get());
+    result.vision.lazyBytes = result.vision.actualAllocatedBytes;
+    result.vision.actualAllocatedBytes = 0;
+    result.visionImages->release();
+    std::fprintf(stderr, "FORK: SPLASH_LAZY_VISION on (vision tower %llu MiB released after load; restored per image request)\n",
+                 static_cast<unsigned long long>(result.vision.lazyBytes >> 20));
+  } else {
+    result.vision = loadVisionWeights(backend, images, vision.get());
+  }
 
   std::vector<WeightFileRecord> records(result.targetFiles().begin(),
                                         result.targetFiles().end());

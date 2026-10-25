@@ -19,6 +19,9 @@ struct QwenVisionWeights final {
   ops::VisionWeights tensors;
   std::vector<WeightFileRecord> files;
   uint64_t actualAllocatedBytes = 0;
+  // FORK (lazy vision): the tower's image bytes while its memory is released
+  // (LoadedModel::visionImages); actualAllocatedBytes is then zero.
+  uint64_t lazyBytes = 0;
 };
 
 // The tower's image, written from an upstream source.

@@ -49,6 +49,13 @@ struct LoadedModel final {
   ModelDescriptor descriptor;
   // The memory of every image the weights below are views of.
   std::shared_ptr<WeightImages> images;
+  // FORK (lazy vision, SPLASH_LAZY_VISION=1): the vision tower's image in
+  // memory of its own, released right after the load and restored inside
+  // the admission of the first start that needs an encode
+  // (Runtime.cpp activate); released again with the vision arena once no
+  // image waits for one (releaseOneCache). Null without the flag: the tower
+  // then lives in `images` as upstream.
+  std::shared_ptr<WeightImages> visionImages;
   TargetWeights target;
   DFlashDraftWeights draft;
   QwenVisionWeights vision;

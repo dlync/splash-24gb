@@ -671,6 +671,11 @@ struct ModelTelemetry final {
   // inside an image, and every image's rows anything holds, each counted
   // once.
   uint64_t visionArenaBytes = 0;
+  // FORK (lazy vision): the tower's weights while resident, and how often a
+  // start restored them / a reclaim released them.
+  uint64_t visionWeightsBytes = 0;
+  uint64_t visionWeightRestores = 0;
+  uint64_t visionWeightReleases = 0;
   uint64_t embeddingCacheBytes = 0;
   uint64_t stateHeldImageBytes = 0;
   uint64_t imageRowsBytes = 0;

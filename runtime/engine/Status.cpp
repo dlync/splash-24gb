@@ -498,6 +498,9 @@ std::string runtimeStatusJson(
       << ",\"embedding_reuses\":" << executorTelemetry.imageEmbeddingReuses
       << ",\"embedding_evictions\":" << executorTelemetry.imageEmbeddingEvictions
       << ",\"arena_bytes\":" << executorTelemetry.visionArenaBytes
+      << ",\"weights_bytes\":" << executorTelemetry.visionWeightsBytes
+      << ",\"weight_restores\":" << executorTelemetry.visionWeightRestores
+      << ",\"weight_releases\":" << executorTelemetry.visionWeightReleases
       << ",\"cached_bytes\":" << executorTelemetry.embeddingCacheBytes
       << ",\"state_held_bytes\":" << executorTelemetry.stateHeldImageBytes
       << ",\"rows_bytes\":" << executorTelemetry.imageRowsBytes

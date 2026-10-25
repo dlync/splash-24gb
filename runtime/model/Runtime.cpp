@@ -667,6 +667,15 @@ struct Runtime::Impl {
       vision.reset();
       return bytes;
     }
+    // FORK (lazy vision): the tower's weights go after its arena, once no
+    // image waits for an encode and no command can read them; the next start
+    // that encodes restores them (activate).
+    if (!vision && model.visionImages && !model.visionImages->released() && visionIdle() &&
+        !backend.commandInFlight()) {
+      model.visionImages->release();
+      ++counters.visionWeightReleases;
+      return model.vision.lazyBytes;
+    }
     if (!backend.commandInFlight()) {
       if (historyStream && !stagingHeld())
         if (const uint64_t bytes = historyStream->releaseIdle())
@@ -757,12 +766,29 @@ struct Runtime::Impl {
         encodePatches && !(vision && vision->maximumPatches() >= encodePatches)
             ? ops::Vision::scratchBytes(model.vision.tensors.layout, encodePatches)
             : 0;
+    // FORK (lazy vision): an encode needs the tower's weights, which come
+    // back inside this admission, after everything else the start allocates,
+    // so a refusal anywhere leaves them released (WeightImages::restore
+    // releases what its own writer could not fund).
+    WeightImages *lazyWeights =
+        encodePatches && model.visionImages && model.visionImages->released() ? model.visionImages.get() : nullptr;
+    const uint64_t weightBytes = lazyWeights ? model.vision.lazyBytes : 0;
     std::shared_ptr<ops::Vision> encoder;
     const uint8_t *pixels = request.imagePixels.data();
     const auto allocate = [&] {
       if (encoderBytes) {
         encoder = std::make_shared<ops::Vision>(
             backend, model.vision.tensors, encodePatches);
+      }
+      if (lazyWeights) {
+        // The lane's admission already reserved weightBytes: no second ask.
+        const metal::AllocationAdmission reserved = [](uint64_t, const std::function<void()> &run) {
+          run();
+          return metal::AllocationResult{};
+        };
+        while (!lazyWeights->restore(reserved)) {
+        }
+        ++counters.visionWeightRestores;
       }
       for (ImageState &image : staged) {
         const ImageSpan &span = image.span;
@@ -779,7 +805,7 @@ struct Runtime::Impl {
       }
     };
     StateAdmission admission = laneAdmission(
-        stateLane, states.tryActivateLane(stateLane, request.id, encoderBytes + bytes, allocate));
+        stateLane, states.tryActivateLane(stateLane, request.id, encoderBytes + bytes + weightBytes, allocate));
     if (!admission.granted()) {
       admission.held = std::make_shared<const Matched>(
           Matched{std::move(shared), encodePatches && !encoderBytes ? vision : nullptr});
@@ -3411,6 +3437,9 @@ ModelTelemetry Runtime::telemetry() const noexcept {
   result.idleDraftRings = impl_->states.idleRings();
   result.idleContextWindows = impl_->states.idleWindows();
   result.visionArenaBytes = impl_->vision ? impl_->vision->arenaBytes() : 0;
+  result.visionWeightsBytes = impl_->model.visionImages
+                                  ? (impl_->model.visionImages->released() ? 0 : impl_->model.vision.lazyBytes)
+                                  : impl_->model.vision.actualAllocatedBytes;
   result.embeddingCacheBytes = impl_->embeddingCacheBytes;
   result.verifyBudget = impl_->verifyBudget.has_value();
   result.stateHeldImageBytes = impl_->heldRowsBytes(false);
