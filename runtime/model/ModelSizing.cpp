@@ -85,7 +85,10 @@ StreamableWeights streamableWeights(const std::filesystem::path &root, const Mod
       },
       descriptor.target);
   result.loadedBytes += draftImageBytes(root / "draft", descriptor.draft);
-  if (descriptor.hasVision()) result.loadedBytes += visionImageBytes(descriptor.vision);
+  // FORK (lazy vision): a tower that is released after its load and restored
+  // per image request is not among the images the plan holds; the request
+  // that needs it takes it from the headroom under its admission.
+  if (descriptor.hasVision() && !lazyVisionEnabled()) result.loadedBytes += visionImageBytes(descriptor.vision);
   return result;
 }
 

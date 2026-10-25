@@ -45,6 +45,12 @@ struct ModelLoadOptions final {
   std::shared_ptr<SsdReaders> readers;
 };
 
+// FORK (lazy vision): whether SPLASH_LAZY_VISION is set and not "0". The
+// vision tower then loads into memory of its own (LoadedModel::visionImages)
+// and is left out of the pre-load sizing plan (ModelSizing streamableWeights),
+// so the expert store is planned as for a language-only model.
+[[nodiscard]] bool lazyVisionEnabled() noexcept;
+
 struct LoadedModel final {
   ModelDescriptor descriptor;
   // The memory of every image the weights below are views of.

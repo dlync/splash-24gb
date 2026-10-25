@@ -14,6 +14,14 @@
 
 namespace splash::model {
 
+bool lazyVisionEnabled() noexcept {
+  static const bool enabled = [] {
+    const char *value = std::getenv("SPLASH_LAZY_VISION");
+    return value && *value && *value != '0';
+  }();
+  return enabled;
+}
+
 void requireCompatibleModel(const LoadedModel &model) {
   if (!model.descriptor.valid() ||
       model.descriptor.draft != model.draft.layout ||
@@ -112,9 +120,7 @@ LoadedModel loadModel(metal::MetalBackend &backend,
   // sees no vision weights (the expert arena is planned as for a
   // language-only model) and the first start that needs an encode restores
   // them inside its admission (Runtime.cpp activate).
-  const char *lazyFlag = std::getenv("SPLASH_LAZY_VISION");
-  const bool lazyVision = vision && lazyFlag && *lazyFlag && *lazyFlag != '0';
-  if (lazyVision) {
+  if (vision && lazyVisionEnabled()) {
     result.visionImages = std::make_shared<WeightImages>(backend, images.contentIdentity());
     result.vision = loadVisionWeights(backend, *result.visionImages, vision.get());
     result.vision.lazyBytes = result.vision.actualAllocatedBytes;
