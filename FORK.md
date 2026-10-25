@@ -1,9 +1,9 @@
-# Splash fork: faster expert streaming on small Macs
+# splash-24gb: faster expert streaming for Splash on small Macs
 
-This is a fork of [incoai/splash](https://github.com/incoai/splash) 1.4.0. It speeds up
+splash-24gb is a fork of [incoai/splash](https://github.com/incoai/splash) 1.4.0. It speeds up
 decode for large MoE models whose experts don't fit in RAM and are streamed from the SSD.
 It was built and tested on a **24 GB MacBook Air** running
-`ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF:Q2_0` with the full 256K context.
+`ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF:Q2_0` with the full 256K context. The name comes from the test machine: it should help any Mac where the model is too big for RAM.
 
 Every change is behind an environment variable and **off by default**. With no variables
 set, the binary behaves like upstream 1.4.0.

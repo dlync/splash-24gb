@@ -1,6 +1,6 @@
 # Splash
 
-> **Fork:** faster SSD expert streaming for MoE models on small Macs. See [FORK.md](FORK.md).
+> **splash-24gb** is a fork of Splash: faster SSD expert streaming for MoE models on Macs where the model does not fit in RAM (built on a 24 GB Air). See [FORK.md](FORK.md). Not affiliated with incoai.
 
 [![CI](https://github.com/incoai/splash/actions/workflows/ci.yml/badge.svg)](https://github.com/incoai/splash/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
