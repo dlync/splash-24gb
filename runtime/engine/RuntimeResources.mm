@@ -466,6 +466,7 @@ std::array<uint8_t, 32> parseSha256(std::string_view value) {
 void requireLoadedModel(const model::LoadedModel &loaded) {
   if (!loaded.targetActualAllocatedBytes() ||
       !loaded.draft.actualAllocatedBytes ||
+      // FORK (lazy vision): a lazily loaded tower counts as loaded.
       (loaded.descriptor.hasVision() && !loaded.vision.actualAllocatedBytes && !loaded.vision.lazyBytes) ||
       loaded.manifestFingerprintSha256.empty() ||
       loaded.targetManifestFingerprint().empty()) {

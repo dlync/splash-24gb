@@ -498,6 +498,7 @@ std::string runtimeStatusJson(
       << ",\"embedding_reuses\":" << executorTelemetry.imageEmbeddingReuses
       << ",\"embedding_evictions\":" << executorTelemetry.imageEmbeddingEvictions
       << ",\"arena_bytes\":" << executorTelemetry.visionArenaBytes
+      // FORK (lazy vision): the tower's weight bytes and restore/release counts.
       << ",\"weights_bytes\":" << executorTelemetry.visionWeightsBytes
       << ",\"weight_restores\":" << executorTelemetry.visionWeightRestores
       << ",\"weight_releases\":" << executorTelemetry.visionWeightReleases
